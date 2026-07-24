@@ -12,11 +12,14 @@
 	],
 	"scripts": {
 		"clean": "shx rm -rf dist",
-		"build": "tsgo -p tsconfig.build.json && shx chmod +x dist/cli.js",
+		"build": "tsgo -p tsconfig.build.json && shx mkdir -p dist/skills && shx cp -R ../../skills/vibe-mathing dist/skills/vibe-mathing && shx cp -R src/prompts dist/prompts && shx chmod +x dist/cli.js",
 		"prepublishOnly": "npm run clean && npm run build"
 	},
 	"dependencies": {
-		"@earendil-works/pi-coding-agent": "^0.82.0"
+		"@earendil-works/pi-ai": "^0.82.0",
+		"@earendil-works/pi-coding-agent": "^0.82.0",
+		"typebox": "1.1.38",
+		"vibe-core": "0.1.0"
 	},
 	"license": "MIT",
 	"repository": {

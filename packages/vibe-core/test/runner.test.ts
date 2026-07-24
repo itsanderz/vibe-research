@@ -72,14 +72,29 @@ describe("runExperiment — WSL integration", () => {
 		"kills a run that exceeds its timeout and still saves artifacts",
 		async () => {
 			const dir = makeTempDir();
-			const code = "import time\ntime.sleep(5)\nprint('should not get here')\n";
+			// Sleeps well past the wrapped Linux `timeout` deadline
+			// (timeoutSeconds + 5 = 6s here), not just past timeoutSeconds
+			// itself. This means the run can only actually terminate promptly
+			// via the in-distro `timeout` wrapper — a Windows-side taskkill
+			// that silently failed to reach the Linux-side process (the M1
+			// bug this wrapper fixes; see LEARNINGS.md) would otherwise leave
+			// this hanging until the full 12s sleep completes, which the
+			// duration assertion below would catch.
+			const code = "import time\ntime.sleep(12)\nprint('should not get here')\n";
+			const started = Date.now();
 			const result = await runExperiment(dir, {
 				code,
 				purpose: "check timeout handling",
 				timeoutSeconds: 1,
 			});
+			const elapsedMs = Date.now() - started;
 
 			expect(result.timedOut).toBe(true);
+			// Must resolve well before the 12s sleep would complete on its
+			// own — proves the Linux-side `timeout` (deadline: 6s) actually
+			// killed the process rather than the run hanging until the
+			// script naturally exits.
+			expect(elapsedMs).toBeLessThan(10_000);
 
 			const savedCode = readFileSync(join(result.artifactDir, "experiment.py"), "utf8");
 			expect(savedCode).toBe(code);
@@ -88,8 +103,11 @@ describe("runExperiment — WSL integration", () => {
 
 			const savedResult = JSON.parse(readFileSync(join(result.artifactDir, "result.json"), "utf8"));
 			expect(savedResult.timedOut).toBe(true);
+			// pythonCommand documents the actual invocation, including the
+			// in-distro timeout wrapper (timeoutSeconds=1 + 5s grace = 6s).
+			expect(savedResult.pythonCommand).toContain("timeout 6s");
 		},
-		15_000,
+		20_000,
 	);
 });
 

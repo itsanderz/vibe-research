@@ -104,12 +104,16 @@ function generateRunId(code: string, now: Date): string {
  * is not treated as an error — this is cleanup on a timeout path, not a
  * step whose success the caller depends on for correctness.
  *
- * Known limitation: this reaches the Windows-side `wsl.exe` client process
- * tree. A command already handed off to the WSL instance is not always
- * guaranteed to be killed by terminating its Windows-side client (a known
- * WSL interop limitation) — reaching into the distro to kill the Linux-side
- * process would need a distro-side `pkill`, which spec §9.1 does not ask
- * the harness to do.
+ * Known limitation (see LEARNINGS.md, M1): this reaches the Windows-side
+ * `wsl.exe` client process tree only. Terminating that client is not always
+ * enough to kill the Linux-side process it launched (a known WSL interop
+ * limitation) — `taskkill` can return successfully while the python process
+ * keeps running inside the distro, which would otherwise leave `wsl.exe`
+ * (and this function's caller) hanging past the reported timeout waiting
+ * for a `close` event that never comes. That is why `runExperiment` also
+ * wraps the in-distro command with the Linux `timeout` utility below: this
+ * Windows-side kill is now a fast-path backstop, not the sole enforcement
+ * mechanism.
  */
 function killProcessTree(pid: number): void {
 	try {
@@ -166,16 +170,35 @@ export function wslAvailable(opts: RunnerOptions = {}): boolean {
 	}
 }
 
+/** Seconds added to `timeoutSeconds` for the in-distro `timeout` wrapper —
+ * see `runExperiment`'s doc comment. Gives the Windows-side timer/taskkill
+ * fast path (fired at exactly `timeoutSeconds`) a head start before the
+ * Linux-side backstop deadline, so the common case still reports/cleans up
+ * promptly, while the backstop still fires soon after either way. */
+const LINUX_TIMEOUT_GRACE_SECONDS = 5;
+
 /**
  * Runs one reproducible Python experiment inside WSL2 — spec §9.1 / §10.
  *
  * Writes `experiment.py` and `purpose.txt` into a fresh
  * `<workspaceDir>/runs/<run-id>/` directory *before* executing, so a
  * crashed or timed-out run still leaves its artifacts behind. Execution is
- * launched via `wsl.exe -d <distro> -- <pythonBin> <wslPath>` using an argv
- * array (`child_process.spawn`), never shell-string interpolation, so paths
- * containing spaces are handled correctly and no shell metacharacter in
- * `code` or `purpose` can affect the invocation.
+ * launched via `wsl.exe -d <distro> -- timeout <timeoutSeconds+5>s
+ * <pythonBin> <wslPath>` using an argv array (`child_process.spawn`), never
+ * shell-string interpolation, so paths containing spaces are handled
+ * correctly and no shell metacharacter in `code` or `purpose` can affect the
+ * invocation.
+ *
+ * The in-distro `timeout` (GNU coreutils) is the reliable deadline
+ * enforcement: it runs *inside* the WSL instance, so it can always actually
+ * kill the python process, unlike a Windows-side `taskkill` against the
+ * `wsl.exe` client (see LEARNINGS.md, M1 — that reliably kills the Windows
+ * client but not always the Linux-side process it spawned, which can leave
+ * this function waiting forever for a `close` event). The pre-existing
+ * Windows-side `setTimeout` + `killProcessTree` at exactly `timeoutSeconds`
+ * is kept as a fast-path backstop: it still sets `timedOut` promptly and
+ * often succeeds at killing things quickly, but correctness (the promise
+ * always eventually settling) no longer depends on it.
  *
  * A failed or timed-out run is *data*, not an exception (spec §9.1): a
  * non-zero exit code, stderr output, or a timeout are all recorded in the
@@ -203,7 +226,8 @@ export async function runExperiment(
 	writeFileSync(join(artifactDir, "purpose.txt"), options.purpose);
 
 	const wslScriptPath = toWslPath(scriptPath);
-	const pythonCommand = `wsl.exe -d ${distro} -- ${pythonBin} ${wslScriptPath}`;
+	const linuxTimeoutSeconds = timeoutSeconds + LINUX_TIMEOUT_GRACE_SECONDS;
+	const pythonCommand = `wsl.exe -d ${distro} -- timeout ${linuxTimeoutSeconds}s ${pythonBin} ${wslScriptPath}`;
 
 	const stdoutCollector = createByteCappedCollector(MAX_CAPTURE_BYTES);
 	const stderrCollector = createByteCappedCollector(MAX_CAPTURE_BYTES);
@@ -211,9 +235,11 @@ export async function runExperiment(
 	const started = process.hrtime.bigint();
 	const { exitCode, timedOut } = await new Promise<{ exitCode: number | null; timedOut: boolean }>(
 		(settlePromise, rejectPromise) => {
-			const child = spawn("wsl.exe", ["-d", distro, "--", pythonBin, wslScriptPath], {
-				stdio: ["ignore", "pipe", "pipe"],
-			});
+			const child = spawn(
+				"wsl.exe",
+				["-d", distro, "--", "timeout", `${linuxTimeoutSeconds}s`, pythonBin, wslScriptPath],
+				{ stdio: ["ignore", "pipe", "pipe"] },
+			);
 
 			let settled = false;
 			let didTimeOut = false;
