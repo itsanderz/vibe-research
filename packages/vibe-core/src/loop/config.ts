@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { familyOf } from "./family.ts";
 
 /**
  * Loop config — spec docs/research/loop-design.md "Roles & the checker gate":
@@ -111,6 +112,31 @@ export function validateConfig(raw: unknown): LoopConfig {
 	}
 	const budget = validateBudget(raw.budget);
 	return { roles, budget };
+}
+
+/**
+ * Refuses a configured checker whose model family (`familyOf`) matches the
+ * reasoner's — spec docs/research/loop-design.md "Roles & the checker gate":
+ * "the loop refuses to start a checker session whose model family ... equals
+ * the proposing session's." A same-family checker can't provide independent
+ * verification, so this is a config error, not a runtime one: it's checked
+ * once at loop start (see `loop/controller.ts`), before any session runs. A
+ * config with no `roles.checker` at all is fine — that's the "no checker
+ * configured" case (proposals simply stay open).
+ */
+export function assertDistinctCheckerFamily(config: LoopConfig): void {
+	const checker = config.roles.checker;
+	if (!checker) return;
+
+	const reasonerFamily = familyOf(config.roles.reasoner.model);
+	const checkerFamily = familyOf(checker.model);
+	if (reasonerFamily === checkerFamily) {
+		throw new ConfigValidationError(
+			`roles.checker ("${checker.model}") must be a different model family than roles.reasoner ` +
+				`("${config.roles.reasoner.model}") — both resolve to family "${reasonerFamily}". A checker from the ` +
+				`same model family cannot provide independent verification (docs/research/loop-design.md "Roles & the checker gate").`,
+		);
+	}
 }
 
 /**

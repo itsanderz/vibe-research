@@ -11,7 +11,12 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
-import { defineTool, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import {
+	defineTool,
+	type ExtensionAPI,
+	type ExtensionContext,
+	type ExtensionFactory,
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
 	ClaimNotFoundError,
@@ -19,9 +24,50 @@ import {
 	generateDossier,
 	openJournal,
 	openLedger,
+	ProposalAlreadyResolvedError,
+	ProposalNotFoundError,
 	runExperiment,
 	TransitionError,
 } from "vibe-core";
+
+/**
+ * Session role — M2s2, spec "Roles & the checker gate". The pi SDK's
+ * `ExtensionFactory` type is `(pi: ExtensionAPI) => void | Promise<void>`
+ * with no config parameter, and `ExtensionContext` carries no custom-config
+ * field either (checked packages/coding-agent/src/core/extensions/types.ts:
+ * no field on `ExtensionContext` or `DefaultResourceLoader`'s
+ * `extensionFactories?: InlineExtension[]` passes anything but the bare
+ * factory function through). There is no built-in channel to parameterize an
+ * extension factory, so `createResearchExtension(options)` below is a
+ * closure-based factory-of-factory: the *cleanest* supported mechanism,
+ * capturing `role` before returning the real `ExtensionFactory`. The env var
+ * is an explicit fallback for callers (or a future CLI flag) that can't reach
+ * into the loader's extensionFactories array to pass options directly.
+ */
+const SESSION_ROLE_ENV_VAR = "VIBE_SESSION_ROLE";
+
+export interface ResearchExtensionOptions {
+	/** "reasoner" (default) or "checker" — see module doc comment above for how this gets here. */
+	role?: string;
+}
+
+function resolveRole(options?: ResearchExtensionOptions): string {
+	return options?.role ?? process.env[SESSION_ROLE_ENV_VAR] ?? "reasoner";
+}
+
+/**
+ * Protected statuses (spec "Roles & the checker gate"): reaching any of
+ * these is the trust-sensitive step in an investigation, so a non-checker
+ * session's math_update_claim to one of these becomes a `proposeTransition`
+ * instead of applying immediately — only a checker session (a different
+ * model family, enforced by the loop — see vibe-core's `assertDistinctCheckerFamily`)
+ * may apply it, via `math_review_proposal`.
+ */
+const PROTECTED_STATUSES: ReadonlySet<string> = new Set([
+	ClaimStatus.INFORMALLY_PROVED,
+	ClaimStatus.FORMALLY_VERIFIED,
+	ClaimStatus.COUNTEREXAMPLE_FOUND,
+]);
 
 /** Literal tuple (not `Object.values`) so the tool schema keeps literal
  * status types — must stay in sync with `ClaimStatus` in
@@ -80,65 +126,150 @@ const mathRecordClaim = defineTool({
 	},
 });
 
-const mathUpdateClaim = defineTool({
-	name: "math_update_claim",
-	label: "Update Claim",
-	description:
-		"Move a claim to a new status, with evidence of what check was actually run. " +
-		"Evidence must state what was done (method, scope/domain tested, arithmetic mode, artifact path) — " +
-		"'no counterexample found' with no stated scope is not evidence. " +
-		"Statuses only strengthen: UNTESTED < TESTED_SMALL_CASES < COMPUTATIONALLY_VERIFIED < INFORMALLY_PROVED < FORMALLY_VERIFIED, " +
-		"and a transition may not move to a lower rank. COUNTEREXAMPLE_FOUND is the one exception: it is reachable " +
-		"from any non-terminal status (a valid counterexample refutes regardless of prior strength) and is itself " +
-		"terminal — no further transitions are legal once a claim is there. FORMALLY_VERIFIED additionally requires " +
-		"a non-empty checkerArtifact. An illegal transition is rejected with a clear error explaining why — read it " +
-		"and choose a legal status; it is not a crash.",
-	promptSnippet: "Move a claim to a new (only-strengthening) status with evidence",
-	promptGuidelines: [
-		"Never call math_update_claim without evidence that states the actual method, scope, and arithmetic mode used.",
-		"If math_update_claim rejects a transition, do not retry the same call — pick a status the ledger will accept, or record a new claim.",
-	],
-	parameters: Type.Object({
-		id: Type.String({ description: "Claim id, from math_record_claim or math_list_claims." }),
-		status: StringEnum(CLAIM_STATUS_VALUES, {
-			description: "The new status. Must not weaken the claim's current status.",
-		}),
-		evidence: Type.Array(Type.String(), {
-			description:
-				"One or more non-empty evidence strings for this transition, e.g. " +
-				"'method=exhaustive search; scope=n in [-1000,1000]; arithmetic=exact integer; artifact=workspace/runs/<id>; result=no counterexample'.",
-		}),
-		checkerArtifact: Type.Optional(
-			Type.String({
-				description:
-					"Required, non-empty, when status is FORMALLY_VERIFIED — path/reference to the checker's output.",
+/**
+ * `math_update_claim` is role-aware (M2s2): a non-checker session moving a
+ * claim to a PROTECTED status doesn't apply the transition — it records a
+ * proposal for a checker session (a different model family) to review from
+ * the artifacts. Every other transition (including COUNTEREXAMPLE_FOUND for
+ * a *checker* session itself, e.g. re-resolving a proposal by hand) is
+ * unaffected. `role` is captured by the enclosing `createResearchExtension`
+ * closure — see the module doc comment above `SESSION_ROLE_ENV_VAR`.
+ */
+function createMathUpdateClaim(role: string) {
+	return defineTool({
+		name: "math_update_claim",
+		label: "Update Claim",
+		description:
+			"Move a claim to a new status, with evidence of what check was actually run. " +
+			"Evidence must state what was done (method, scope/domain tested, arithmetic mode, artifact path) — " +
+			"'no counterexample found' with no stated scope is not evidence. " +
+			"Statuses only strengthen: UNTESTED < TESTED_SMALL_CASES < COMPUTATIONALLY_VERIFIED < INFORMALLY_PROVED < FORMALLY_VERIFIED, " +
+			"and a transition may not move to a lower rank. COUNTEREXAMPLE_FOUND is the one exception: it is reachable " +
+			"from any non-terminal status (a valid counterexample refutes regardless of prior strength) and is itself " +
+			"terminal — no further transitions are legal once a claim is there. FORMALLY_VERIFIED additionally requires " +
+			"a non-empty checkerArtifact. An illegal transition is rejected with a clear error explaining why — read it " +
+			"and choose a legal status; it is not a crash. In a non-checker session, moving to a PROTECTED status " +
+			"(INFORMALLY_PROVED, FORMALLY_VERIFIED, COUNTEREXAMPLE_FOUND) does not apply immediately — it is recorded " +
+			"as a proposal for an independent checker session to review from the artifacts; that is expected, not an error.",
+		promptSnippet: "Move a claim to a new (only-strengthening) status with evidence",
+		promptGuidelines: [
+			"Never call math_update_claim without evidence that states the actual method, scope, and arithmetic mode used.",
+			"If math_update_claim rejects a transition, do not retry the same call — pick a status the ledger will accept, or record a new claim.",
+		],
+		parameters: Type.Object({
+			id: Type.String({ description: "Claim id, from math_record_claim or math_list_claims." }),
+			status: StringEnum(CLAIM_STATUS_VALUES, {
+				description: "The new status. Must not weaken the claim's current status.",
 			}),
-		),
-	}),
-	async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-		const ledger = openLedger(workspaceDir(ctx));
-		// ClaimNotFoundError / TransitionError both extend Error with a clear,
-		// human-readable .message. Letting them propagate from execute() is the
-		// documented way to signal a tool failure to the LLM (isError: true,
-		// message reported) without crashing the extension or the session — see
-		// "Signaling errors" in docs/extensions.md.
-		const claim = ledger.updateClaim(
-			params.id,
-			params.status,
-			params.evidence,
-			params.checkerArtifact ? { checkerArtifact: params.checkerArtifact } : undefined,
-		);
-		return {
-			content: [
-				{
-					type: "text",
-					text: `Claim ${claim.id} -> ${claim.status} (${claim.evidence.length} evidence entr${claim.evidence.length === 1 ? "y" : "ies"} total).`,
-				},
-			],
-			details: { claim },
-		};
-	},
-});
+			evidence: Type.Array(Type.String(), {
+				description:
+					"One or more non-empty evidence strings for this transition, e.g. " +
+					"'method=exhaustive search; scope=n in [-1000,1000]; arithmetic=exact integer; artifact=workspace/runs/<id>; result=no counterexample'.",
+			}),
+			checkerArtifact: Type.Optional(
+				Type.String({
+					description:
+						"Required, non-empty, when status is FORMALLY_VERIFIED — path/reference to the checker's output.",
+				}),
+			),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const ledger = openLedger(workspaceDir(ctx));
+			const opts = params.checkerArtifact ? { checkerArtifact: params.checkerArtifact } : undefined;
+
+			if (role !== "checker" && PROTECTED_STATUSES.has(params.status)) {
+				const proposal = ledger.proposeTransition(
+					params.id,
+					params.status,
+					params.evidence,
+					{ role, model: ctx.model?.id ?? "unknown" },
+					opts,
+				);
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Recorded as proposal ${proposal.id}. A checker session using a different model family will review it from the artifacts.`,
+						},
+					],
+					details: { proposal },
+				};
+			}
+
+			// ClaimNotFoundError / TransitionError both extend Error with a clear,
+			// human-readable .message. Letting them propagate from execute() is the
+			// documented way to signal a tool failure to the LLM (isError: true,
+			// message reported) without crashing the extension or the session — see
+			// "Signaling errors" in docs/extensions.md.
+			const claim = ledger.updateClaim(params.id, params.status, params.evidence, opts);
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Claim ${claim.id} -> ${claim.status} (${claim.evidence.length} evidence entr${claim.evidence.length === 1 ? "y" : "ies"} total).`,
+					},
+				],
+				details: { claim },
+			};
+		},
+	});
+}
+
+/**
+ * Checker-only (spec "Roles & the checker gate"): resolves an open
+ * transition proposal. Registered only when `role === "checker"` — see
+ * `createResearchExtension`.
+ */
+function createMathReviewProposal(role: string) {
+	return defineTool({
+		name: "math_review_proposal",
+		label: "Review Proposal",
+		description:
+			"Resolve an open transition proposal — checker sessions only. You must independently re-derive/" +
+			"re-verify the transition strictly from the artifacts already on record (math_list_claims for the " +
+			"claim sheet, the evidence strings already on the claim, and any experiment artifacts under " +
+			"workspace/runs/ referenced by that evidence) — never trust the proposing session's own claim of " +
+			"correctness; its evidence text is a lead to check, not a fact. Approving applies the transition with " +
+			"the exact same validation math_update_claim enforces (an approved-but-invalid proposal is rejected " +
+			"with a thrown error and nothing is recorded — neither the claim nor the proposal changes). Rejecting " +
+			"only records your verdict; the claim is left untouched either way.",
+		promptSnippet: "Resolve an open transition proposal after independently re-verifying it from artifacts",
+		promptGuidelines: [
+			"Never approve a proposal without independently re-deriving/re-verifying it from the artifacts on record — the proposing session's own evidence text is not proof.",
+			"Always pass notes explaining exactly what you checked, whether you approve or reject.",
+		],
+		parameters: Type.Object({
+			proposalId: Type.String({
+				description: "Proposal id (from the checker objective, or math_list_claims context).",
+			}),
+			approved: Type.Boolean({ description: "true to apply the proposed transition, false to reject it." }),
+			notes: Type.Optional(
+				Type.String({ description: "What you independently checked and why you approved or rejected." }),
+			),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const ledger = openLedger(workspaceDir(ctx));
+			// ProposalNotFoundError / ProposalAlreadyResolvedError / TransitionError /
+			// ClaimNotFoundError (the last two from an invalid approve) all extend
+			// Error — same "let it propagate" convention as math_update_claim above.
+			const proposal = ledger.resolveProposal(params.proposalId, {
+				approved: params.approved,
+				byRole: role,
+				byModel: ctx.model?.id ?? "unknown",
+				notes: params.notes,
+			});
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Proposal ${proposal.id} ${proposal.status} (claim ${proposal.claimId} -> ${proposal.toStatus}).`,
+					},
+				],
+				details: { proposal },
+			};
+		},
+	});
+}
 
 const mathListClaims = defineTool({
 	name: "math_list_claims",
@@ -299,19 +430,40 @@ const mathGenerateDossier = defineTool({
 	},
 });
 
+/**
+ * Factory-of-factory (M2s2): builds a role-bound `ExtensionFactory`.
+ * `math_update_claim` gates protected-status transitions into proposals for
+ * any role other than "checker"; `math_review_proposal` is registered only
+ * for role "checker" — see module doc comment above `SESSION_ROLE_ENV_VAR`
+ * for why this closure, rather than a config field, is how role gets here.
+ */
+export function createResearchExtension(options?: ResearchExtensionOptions): ExtensionFactory {
+	const role = resolveRole(options);
+	return (pi: ExtensionAPI) => {
+		pi.registerTool(mathRecordClaim);
+		pi.registerTool(createMathUpdateClaim(role));
+		pi.registerTool(mathListClaims);
+		pi.registerTool(mathRunPython);
+		pi.registerTool(journalNote);
+		pi.registerTool(mathGenerateDossier);
+		if (role === "checker") {
+			pi.registerTool(createMathReviewProposal(role));
+		}
+	};
+}
+
+// Backward-compatible plain factory (unparameterized — resolves role from
+// VIBE_SESSION_ROLE only, defaulting to "reasoner"). scripts/check-research-extension.mjs
+// and any caller that doesn't need role control keep using this default export.
 export default function researchExtension(pi: ExtensionAPI) {
-	pi.registerTool(mathRecordClaim);
-	pi.registerTool(mathUpdateClaim);
-	pi.registerTool(mathListClaims);
-	pi.registerTool(mathRunPython);
-	pi.registerTool(journalNote);
-	pi.registerTool(mathGenerateDossier);
+	createResearchExtension()(pi);
 }
 
 // Exported for the headless registration check (see scripts/check-research-extension.mjs)
 // and for anything that wants to reuse the tool definitions directly.
-export { mathRecordClaim, mathUpdateClaim, mathListClaims, mathRunPython, journalNote, mathGenerateDossier };
+export { mathRecordClaim, mathListClaims, mathRunPython, journalNote, mathGenerateDossier };
+export { createMathUpdateClaim, createMathReviewProposal, PROTECTED_STATUSES, SESSION_ROLE_ENV_VAR };
 
 // Re-exported so callers of this module don't need a separate vibe-core
-// import just to catch the errors math_update_claim can throw.
-export { ClaimNotFoundError, TransitionError };
+// import just to catch the errors math_update_claim / math_review_proposal can throw.
+export { ClaimNotFoundError, TransitionError, ProposalNotFoundError, ProposalAlreadyResolvedError };

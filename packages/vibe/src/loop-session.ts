@@ -25,7 +25,7 @@ import {
 	SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import type { RunSessionContext, RunSessionFn, RunSessionResult, RunSessionUsage } from "vibe-core";
-import researchExtension from "./extensions/research.ts";
+import { createResearchExtension } from "./extensions/research.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 /** Same bundling convention as cli.ts's bundledArgs: resolved relative to this compiled module so it works regardless of install location. */
@@ -66,9 +66,15 @@ function extractText(message: AssistantMessage | undefined): string {
  *   into a `Model`. A `resolved.error` (bad model string, no auth) is
  *   returned as `RunSessionResult.error` rather than thrown, so the
  *   controller's two-strike logic can see it.
- * - `DefaultResourceLoader` with `extensionFactories: [researchExtension]`
+ * - `DefaultResourceLoader` with `extensionFactories: [createResearchExtension({ role: context.role })]`
  *   and `additionalSkillPaths: [<bundled vibe-mathing skill>]` — the
- *   programmatic equivalent of cli.ts's `-e`/`--skill` flags.
+ *   programmatic equivalent of cli.ts's `-e`/`--skill` flags. `context.role`
+ *   ("reasoner" | "checker", set by the loop controller per iteration — see
+ *   packages/vibe-core/src/loop/controller.ts) is how the loop's role-aware
+ *   gate (spec "Roles & the checker gate") reaches the research extension:
+ *   there's no config channel on the SDK's ExtensionFactory/ExtensionContext,
+ *   so this closure is the mechanism (see extensions/research.ts's doc
+ *   comment on `SESSION_ROLE_ENV_VAR` for the full reasoning).
  * - `createAgentSession({ cwd, agentDir, modelRuntime, model, resourceLoader,
  *   sessionManager })` — `tools` is intentionally omitted: per
  *   `CreateAgentSessionOptions.tools`'s doc comment, omitting it enables the
@@ -108,7 +114,7 @@ export const runSession: RunSessionFn = async (
 		cwd: context.workspaceDir,
 		agentDir,
 		additionalSkillPaths: [skillPath],
-		extensionFactories: [researchExtension],
+		extensionFactories: [createResearchExtension({ role: context.role })],
 	});
 	await resourceLoader.reload();
 

@@ -5,6 +5,8 @@ export * from "./ledger/transitions.ts";
 export * from "./ledger/types.ts";
 export * from "./loop/config.ts";
 export * from "./loop/controller.ts";
+export * from "./loop/family.ts";
 export * from "./loop/state.ts";
+export * from "./modelbook/modelbook.ts";
 export * from "./report/phrasing.ts";
 export * from "./runs/runner.ts";

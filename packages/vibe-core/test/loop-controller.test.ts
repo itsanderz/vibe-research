@@ -3,6 +3,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { openJournal } from "../src/journal/journal.ts";
+import { openLedger } from "../src/ledger/store.ts";
+import { ClaimStatus } from "../src/ledger/types.ts";
+import { ConfigValidationError } from "../src/loop/config.ts";
 import {
 	dataDirFor,
 	INVESTIGATION_COMPLETE_MARKER,
@@ -12,6 +15,7 @@ import {
 	runLoop,
 } from "../src/loop/controller.ts";
 import { initState, saveState } from "../src/loop/state.ts";
+import { aggregateModelbook } from "../src/modelbook/modelbook.ts";
 
 /**
  * No live API calls anywhere in this file — every scenario drives runLoop()
@@ -33,6 +37,30 @@ function makeWorkspace(budget: WorkspaceOptions = {}): string {
 		join(dataDir, "vibe.config.json"),
 		JSON.stringify({
 			roles: { reasoner: { model: "test-provider/test-model" } },
+			budget,
+		}),
+		"utf8",
+	);
+	return workspaceDir;
+}
+
+interface RolesWorkspaceOptions extends WorkspaceOptions {
+	checkerModel?: string;
+}
+
+/** Like makeWorkspace, but lets tests configure roles.checker (M2s2). */
+function makeWorkspaceWithRoles(options: RolesWorkspaceOptions = {}): string {
+	const { checkerModel, ...budget } = options;
+	const workspaceDir = mkdtempSync(join(tmpdir(), "vibe-core-loop-controller-roles-"));
+	const dataDir = dataDirFor(workspaceDir);
+	mkdirSync(dataDir, { recursive: true });
+	writeFileSync(
+		join(dataDir, "vibe.config.json"),
+		JSON.stringify({
+			roles: {
+				reasoner: { model: "openrouter/anthropic/claude-sonnet-5" },
+				...(checkerModel ? { checker: { model: checkerModel } } : {}),
+			},
 			budget,
 		}),
 		"utf8",
@@ -214,5 +242,133 @@ describe("runLoop — plan/act require a problem to start fresh", () => {
 		const runSession: RunSessionFn = vi.fn(async () => okResult("x"));
 		await expect(runLoop(workspaceDir, undefined, { runSession })).rejects.toThrow(/problem is required/);
 		expect(runSession).not.toHaveBeenCalled();
+	});
+});
+
+describe("runLoop — role scheduling (M2s2, spec 'Roles & the checker gate')", () => {
+	it("schedules a CHECKER iteration once a proposal is open, then returns to reasoner once resolved", async () => {
+		const checkerModel = "openrouter/openai/gpt-5.6";
+		const workspaceDir = makeWorkspaceWithRoles({ maxIterations: 25, checkerModel });
+
+		const seenRoles: string[] = [];
+		const seenModels: string[] = [];
+		let call = 0;
+
+		const runSession: RunSessionFn = vi.fn(async (_objective, context: RunSessionContext) => {
+			call += 1;
+			seenRoles.push(context.role);
+			seenModels.push(context.model);
+			const ledger = openLedger(dataDirFor(context.workspaceDir));
+
+			if (call === 1) {
+				const claim = ledger.recordClaim("Claim", []);
+				ledger.proposeTransition(claim.id, ClaimStatus.INFORMALLY_PROVED, ["method=direct proof; result=holds"], {
+					role: "reasoner",
+					model: context.model,
+				});
+				return okResult("proposed a transition, continuing");
+			}
+
+			if (call === 2) {
+				expect(context.role).toBe("checker");
+				for (const proposal of ledger.listProposals("open")) {
+					ledger.resolveProposal(proposal.id, { approved: true, byRole: "checker", byModel: context.model });
+				}
+				return okResult("reviewed and approved");
+			}
+
+			return okResult(INVESTIGATION_COMPLETE_MARKER);
+		});
+
+		const result = await runLoop(workspaceDir, "a trivial problem", { runSession });
+
+		expect(seenRoles).toEqual(["reasoner", "checker", "reasoner"]);
+		expect(seenModels).toEqual([
+			"openrouter/anthropic/claude-sonnet-5",
+			checkerModel,
+			"openrouter/anthropic/claude-sonnet-5",
+		]);
+		expect(result.iterations).toBe(3);
+		expect(result.stopReason).toBe(INVESTIGATION_COMPLETE_MARKER);
+
+		const ledger = openLedger(dataDirFor(workspaceDir));
+		expect(ledger.listProposals("open")).toHaveLength(0);
+		expect(ledger.listProposals("resolved")).toHaveLength(1);
+	});
+
+	it("refuses to run when roles.checker resolves to the same model family as roles.reasoner", async () => {
+		// reasoner "openrouter/anthropic/claude-sonnet-5" and this checker both
+		// resolve to family "anthropic" via familyOf's passthrough extraction.
+		const workspaceDir = makeWorkspaceWithRoles({ maxIterations: 25, checkerModel: "anthropic/claude-haiku" });
+		const runSession: RunSessionFn = vi.fn(async () => okResult("should never run"));
+
+		await expect(runLoop(workspaceDir, "a trivial problem", { runSession })).rejects.toThrow(ConfigValidationError);
+		await expect(runLoop(workspaceDir, "a trivial problem", { runSession })).rejects.toThrow(
+			/different model family/,
+		);
+		expect(runSession).not.toHaveBeenCalled();
+	});
+
+	it("leaves proposals open and journals a note at stop when no checker role is configured", async () => {
+		const workspaceDir = makeWorkspaceWithRoles({ maxIterations: 25 }); // no checkerModel
+		const runSession: RunSessionFn = vi.fn(async (_objective, context: RunSessionContext) => {
+			expect(context.role).toBe("reasoner");
+			const ledger = openLedger(dataDirFor(context.workspaceDir));
+			const claim = ledger.recordClaim("Claim", []);
+			ledger.proposeTransition(claim.id, ClaimStatus.INFORMALLY_PROVED, ["method=direct proof; result=holds"], {
+				role: "reasoner",
+				model: context.model,
+			});
+			return okResult(INVESTIGATION_COMPLETE_MARKER);
+		});
+
+		const result = await runLoop(workspaceDir, "a trivial problem", { runSession });
+
+		expect(runSession).toHaveBeenCalledTimes(1);
+		expect(result.stopReason).toBe(INVESTIGATION_COMPLETE_MARKER);
+
+		const ledger = openLedger(dataDirFor(workspaceDir));
+		expect(ledger.listProposals("open")).toHaveLength(1);
+
+		const entries = openJournal(dataDirFor(workspaceDir)).entries();
+		const stopNote = entries.find((e) => e.phase === "stop");
+		expect(stopNote?.text).toMatch(/awaiting checker/);
+	});
+});
+
+describe("runLoop — modelbook (M2s2, 'learn' step)", () => {
+	it("appends one modelbook session record per iteration, with checker proposal counts", async () => {
+		const checkerModel = "openrouter/openai/gpt-5.6";
+		const workspaceDir = makeWorkspaceWithRoles({ maxIterations: 25, checkerModel });
+		let call = 0;
+
+		const runSession: RunSessionFn = vi.fn(async (_objective, context: RunSessionContext) => {
+			call += 1;
+			const ledger = openLedger(dataDirFor(context.workspaceDir));
+			if (call === 1) {
+				const claim = ledger.recordClaim("Claim", []);
+				ledger.proposeTransition(claim.id, ClaimStatus.INFORMALLY_PROVED, ["method=direct proof; result=holds"], {
+					role: "reasoner",
+					model: context.model,
+				});
+				return okResult("proposed", 40);
+			}
+			if (call === 2) {
+				const [proposal] = ledger.listProposals("open");
+				ledger.resolveProposal(proposal.id, { approved: true, byRole: "checker", byModel: context.model });
+				return okResult("approved", 60);
+			}
+			return okResult(INVESTIGATION_COMPLETE_MARKER, 10);
+		});
+
+		await runLoop(workspaceDir, "a trivial problem", { runSession });
+
+		const agg = aggregateModelbook(dataDirFor(workspaceDir));
+		const reasonerModel = "openrouter/anthropic/claude-sonnet-5";
+		// 2 reasoner sessions (call 1 and call 3) + 1 checker session (call 2).
+		expect(agg[reasonerModel].sessions).toBe(2);
+		expect(agg[reasonerModel].totalTokens).toBe(50);
+		expect(agg[checkerModel].sessions).toBe(1);
+		expect(agg[checkerModel].approvalRate).toBe(1);
 	});
 });

@@ -89,3 +89,38 @@ export function formatEvidence(fields: EvidenceFields): string {
 		.map((key) => `${key}=${fields[key]}`)
 		.join("; ");
 }
+
+/**
+ * Proposed claim-status transition — spec docs/research/loop-design.md
+ * "Roles & the checker gate" (M2s2). Recorded instead of applying directly
+ * when a non-checker session attempts a protected-status transition
+ * (INFORMALLY_PROVED / FORMALLY_VERIFIED / COUNTEREXAMPLE_FOUND): the claim
+ * itself is untouched until a checker session — a different model family —
+ * resolves the proposal.
+ */
+export interface ProposedBy {
+	role: string;
+	model: string;
+}
+
+export interface ProposalResolution {
+	approved: boolean;
+	byRole: string;
+	byModel: string;
+	notes?: string;
+}
+
+export type ProposalStatus = "open" | "approved" | "rejected";
+
+export interface Proposal {
+	id: string;
+	claimId: string;
+	toStatus: ClaimStatus;
+	evidence: string[];
+	checkerArtifact?: string;
+	proposedBy: ProposedBy;
+	status: ProposalStatus;
+	createdAt: string;
+	resolvedAt?: string;
+	resolution?: ProposalResolution;
+}

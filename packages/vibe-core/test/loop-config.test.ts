@@ -2,7 +2,13 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { ConfigValidationError, DEFAULT_BUDGET, loadConfig, validateConfig } from "../src/loop/config.ts";
+import {
+	assertDistinctCheckerFamily,
+	ConfigValidationError,
+	DEFAULT_BUDGET,
+	loadConfig,
+	validateConfig,
+} from "../src/loop/config.ts";
 
 function makeTempDataDir(): string {
 	const dir = mkdtempSync(join(tmpdir(), "vibe-core-loop-config-"));
@@ -78,6 +84,34 @@ describe("validateConfig — rejected shapes", () => {
 		expect(() => validateConfig({ roles: { reasoner: { model: "x/y" } }, budget: { maxToken: 10 } })).toThrow(
 			/not a recognized budget field/,
 		);
+	});
+});
+
+describe("assertDistinctCheckerFamily", () => {
+	it("is a no-op when no roles.checker is configured", () => {
+		const config = validateConfig({ roles: { reasoner: { model: "openrouter/anthropic/claude-sonnet-5" } } });
+		expect(() => assertDistinctCheckerFamily(config)).not.toThrow();
+	});
+
+	it("allows a checker from a different model family (including meta-provider passthrough)", () => {
+		const config = validateConfig({
+			roles: {
+				reasoner: { model: "openrouter/anthropic/claude-sonnet-5" },
+				checker: { model: "openrouter/openai/gpt-5.6-sol" },
+			},
+		});
+		expect(() => assertDistinctCheckerFamily(config)).not.toThrow();
+	});
+
+	it("refuses a checker from the same model family as the reasoner", () => {
+		const config = validateConfig({
+			roles: {
+				reasoner: { model: "openrouter/anthropic/claude-sonnet-5" },
+				checker: { model: "anthropic/claude-haiku" },
+			},
+		});
+		expect(() => assertDistinctCheckerFamily(config)).toThrow(ConfigValidationError);
+		expect(() => assertDistinctCheckerFamily(config)).toThrow(/different model family/);
 	});
 });
 

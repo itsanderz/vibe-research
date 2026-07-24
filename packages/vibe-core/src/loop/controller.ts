@@ -2,14 +2,23 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { generateDossier } from "../dossier/dossier.ts";
 import { openJournal } from "../journal/journal.ts";
-import { loadConfig } from "./config.ts";
+import { openLedger } from "../ledger/store.ts";
+import type { Proposal } from "../ledger/types.ts";
+import { appendSessionRecord } from "../modelbook/modelbook.ts";
+import { assertDistinctCheckerFamily, loadConfig } from "./config.ts";
+import { familyOf } from "./family.ts";
 import { initState, type LoopState, loadState, saveState, stateExists, statePath } from "./state.ts";
 
 /**
  * LoopController — spec docs/research/loop-design.md "The iteration":
- * `plan -> act -> gate -> journal -> learn -> checkpoint`. M2s1 implements
- * plan/act/journal/checkpoint with a fixed per-run objective; `gate`
- * (protected-status enforcement) and `learn` (modelbook.jsonl) are M2s2/M2s3.
+ * `plan -> act -> gate -> journal -> learn -> checkpoint`. M2s1 implemented
+ * plan/act/journal/checkpoint with a fixed per-run objective. M2s2 adds
+ * `gate` (protected-status enforcement, via the research extension's
+ * role-aware transition-proposal gate — see packages/vibe/src/extensions/
+ * research.ts) and `learn` (modelbook.jsonl, per iteration): this file's
+ * role is scheduling — deciding, each iteration, whether to run a normal
+ * reasoner iteration or a CHECKER iteration that reviews open proposals, and
+ * recording a modelbook session record after every iteration either way.
  */
 
 export interface RunSessionUsage {
@@ -29,8 +38,17 @@ export interface RunSessionContext {
 	/** The loop's project root — identical to the `workspaceDir` passed to runLoop(). Session tools resolve `<workspaceDir>/workspace`. */
 	workspaceDir: string;
 	iteration: number;
-	/** `roles.reasoner.model` from the loaded config, e.g. "openrouter/anthropic/claude-sonnet-5". */
+	/** The model for this iteration's role — `roles.reasoner.model` for a normal iteration, `roles.checker.model` for a CHECKER iteration. */
 	model: string;
+	/**
+	 * The session role for this iteration: "reasoner" for the normal
+	 * investigation objective, "checker" when this iteration reviews open
+	 * proposals (spec "Roles & the checker gate"). Passed through to the
+	 * research extension (packages/vibe/src/extensions/research.ts) so it can
+	 * gate protected-status transitions and expose math_review_proposal only
+	 * to checker sessions.
+	 */
+	role: string;
 }
 
 /** Drives one agent session for the given objective. Real implementation: packages/vibe/src/loop-session.ts. Tests inject a fake. */
@@ -92,9 +110,33 @@ function buildObjective(problem: string): string {
 		"Use the math_record_claim / math_update_claim / math_list_claims / math_run_python / journal_note tools",
 		"to record claims and progress as you work — do not just narrate in prose.",
 		"",
+		"Note: math_update_claim to a protected status (INFORMALLY_PROVED, FORMALLY_VERIFIED, COUNTEREXAMPLE_FOUND)",
+		"will be recorded as a proposal for a checker session to review, not applied immediately — that is expected,",
+		"keep working from there rather than treating it as an error.",
+		"",
 		`When, and only when, you judge there is no more productive next step right now`,
 		`(a terminal claim status has been reached, or you are genuinely stuck with no new avenue to try this`,
 		`session), end your final message with the literal marker ${INVESTIGATION_COMPLETE_MARKER} on its own line.`,
+	].join("\n");
+}
+
+/** Objective text for a CHECKER iteration — spec "Roles & the checker gate": review every open proposal strictly from artifacts, never trust the proposing session's own evidence text. */
+function buildCheckerObjective(proposals: Proposal[]): string {
+	const lines = proposals.map(
+		(p) =>
+			`- proposal ${p.id}: claim ${p.claimId} -> ${p.toStatus} (proposed by ${p.proposedBy.role}:${p.proposedBy.model})`,
+	);
+	return [
+		"You are a CHECKER session reviewing protected-status transitions proposed by a different session.",
+		"Never trust the proposing session's claim of correctness — re-derive/re-verify each transition strictly",
+		"from the artifacts already on record: use math_list_claims for the claim sheet, read the evidence strings",
+		"already on each claim, and inspect experiment artifacts under workspace/runs/ referenced by that evidence.",
+		"",
+		"Open proposals to review:",
+		...lines,
+		"",
+		"For each open proposal, call math_review_proposal with your verdict (approved: true/false) and notes",
+		"explaining what you checked. Once every open proposal above has been resolved, end your turn.",
 	].join("\n");
 }
 
@@ -123,6 +165,7 @@ export async function runLoop(
 	mkdirSync(dataDir, { recursive: true });
 
 	const config = loadConfig(dataDir);
+	assertDistinctCheckerFamily(config);
 	const journal = openJournal(dataDir);
 	const now = deps.now ?? Date.now;
 
@@ -174,17 +217,31 @@ export async function runLoop(
 			break;
 		}
 
-		// plan
+		// plan — a fresh ledger read each iteration: sessions mutate claims.jsonl
+		// out of process from this loop (via the research extension's own
+		// openLedger() calls), so this must never reuse a Ledger handle opened
+		// before the previous session ran.
 		const iteration = state.iteration + 1;
-		const objective = buildObjective(effectiveProblem);
+		const ledger = openLedger(dataDir);
+		const openProposals = ledger.listProposals("open");
+		const checkerRole = config.roles.checker;
+		const isCheckerIteration = openProposals.length > 0 && checkerRole !== undefined;
+		const role = isCheckerIteration ? "checker" : "reasoner";
+		const model = isCheckerIteration ? (checkerRole as { model: string }).model : config.roles.reasoner.model;
+		const objective = isCheckerIteration ? buildCheckerObjective(openProposals) : buildObjective(effectiveProblem);
+		const proposalsResolvedBefore = new Set(ledger.listProposals("resolved").map((p) => p.id));
 		journal.note(
 			"plan",
-			`Iteration ${iteration}: fixed investigation objective (model: ${config.roles.reasoner.model}).`,
+			isCheckerIteration
+				? `Iteration ${iteration}: CHECKER iteration reviewing ${openProposals.length} open proposal(s) (model: ${model}).`
+				: `Iteration ${iteration}: fixed investigation objective (model: ${model}).`,
 		);
 
 		// act
-		const context: RunSessionContext = { workspaceDir, iteration, model: config.roles.reasoner.model };
+		const context: RunSessionContext = { workspaceDir, iteration, model, role };
+		const sessionStartMs = now();
 		const result = await deps.runSession(objective, context);
+		const durationMs = now() - sessionStartMs;
 
 		// journal (phase "iteration")
 		state.iteration = iteration;
@@ -202,6 +259,29 @@ export async function runLoop(
 
 		// checkpoint
 		saveState(dataDir, state);
+
+		// learn — one modelbook.jsonl record per iteration, success or error.
+		// Checker-only: count proposals this iteration's session resolved by
+		// diffing against the resolved set captured before the session ran.
+		let proposalsApproved: number | undefined;
+		let proposalsRejected: number | undefined;
+		if (isCheckerIteration) {
+			const resolvedAfter = openLedger(dataDir).listProposals("resolved");
+			const resolvedThisIteration = resolvedAfter.filter((p) => !proposalsResolvedBefore.has(p.id));
+			proposalsApproved = resolvedThisIteration.filter((p) => p.resolution?.approved === true).length;
+			proposalsRejected = resolvedThisIteration.filter((p) => p.resolution?.approved === false).length;
+		}
+		appendSessionRecord(dataDir, {
+			at: new Date(now()).toISOString(),
+			role,
+			model,
+			family: familyOf(model),
+			objectiveKind: isCheckerIteration ? "checker" : "investigate",
+			tokens: result.usage,
+			durationMs,
+			outcome: result.error ? "error" : "completed",
+			...(proposalsApproved !== undefined ? { proposalsApproved, proposalsRejected } : {}),
+		});
 
 		deps.onIteration?.({
 			iteration,
@@ -228,6 +308,19 @@ export async function runLoop(
 
 	state.stopped = { reason: stopReason as string, at: new Date(now()).toISOString() };
 	saveState(dataDir, state);
+
+	// Never auto-approve: if proposals are still open at stop, say so — loudly
+	// when there's no checker configured to ever resolve them.
+	const openProposalsAtStop = openLedger(dataDir).listProposals("open");
+	if (openProposalsAtStop.length > 0) {
+		journal.note(
+			"stop",
+			config.roles.checker
+				? `${openProposalsAtStop.length} proposal(s) still open at stop.`
+				: `${openProposalsAtStop.length} proposal(s) awaiting checker (no checker role configured).`,
+		);
+	}
+
 	journal.note("checkpoint", `Loop stopped: ${stopReason}`);
 	deps.onStop?.({ reason: stopReason as string });
 
