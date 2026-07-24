@@ -26,7 +26,7 @@ Three existing docs feed this: `docs/SPEC.md` (Vibe Math v0 — claim ledger + v
 | Sandbox | Experiments execute inside **WSL2** (harness on Windows) |
 | Problem sources | erdosproblems.com, Drew's Whatifology/Daedalus streams, **and natural-language custom problems** (NL ingest → reading check → confirm) |
 | Repo visibility | Public from first commit |
-| Build routing | Fable 5 = planner/orchestrator/reviewer; Sonnet 5 = all execution (code, browser, runs); Opus only when Sonnet quality is at risk — **latest Opus generation (Opus 5 when it exists; currently Opus 4.8)** |
+| Build routing | **Opus 5 = planner/orchestrator/reviewer** (promoted 2026-07-24 when Fable was retired); Sonnet 5 = all execution (code, browser, runs). Every delegated slice is reviewed by the orchestrator before it counts as done. |
 
 ## Architecture
 
