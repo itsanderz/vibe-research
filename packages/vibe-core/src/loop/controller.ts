@@ -5,20 +5,27 @@ import { openJournal } from "../journal/journal.ts";
 import { openLedger } from "../ledger/store.ts";
 import type { Proposal } from "../ledger/types.ts";
 import { appendSessionRecord } from "../modelbook/modelbook.ts";
-import { assertDistinctCheckerFamily, loadConfig } from "./config.ts";
+import { assertDistinctCheckerFamily, loadConfig, type RoleConfig } from "./config.ts";
 import { familyOf } from "./family.ts";
+import {
+	classifyProviderError,
+	ProviderErrorKind,
+	type ProviderHealthEntry,
+	ProviderHealthStatus,
+} from "./provider-error.ts";
 import { initState, type LoopState, loadState, saveState, stateExists, statePath } from "./state.ts";
+import { RESUMABLE_WITHOUT_FORCE, StopReason } from "./stop-reason.ts";
 
 /**
  * LoopController — spec docs/research/loop-design.md "The iteration":
  * `plan -> act -> gate -> journal -> learn -> checkpoint`. M2s1 implemented
- * plan/act/journal/checkpoint with a fixed per-run objective. M2s2 adds
+ * plan/act/journal/checkpoint with a fixed per-run objective. M2s2 added
  * `gate` (protected-status enforcement, via the research extension's
  * role-aware transition-proposal gate — see packages/vibe/src/extensions/
- * research.ts) and `learn` (modelbook.jsonl, per iteration): this file's
- * role is scheduling — deciding, each iteration, whether to run a normal
- * reasoner iteration or a CHECKER iteration that reviews open proposals, and
- * recording a modelbook session record after every iteration either way.
+ * research.ts) and `learn` (modelbook.jsonl, per iteration). M2s3 adds
+ * provider-health fallbacks (spec "Budgets & provider health"), the
+ * AWAITING_FUEL pause, and normalized StopReason codes (spec "Resume &
+ * stop").
  */
 
 export interface RunSessionUsage {
@@ -32,13 +39,22 @@ export interface RunSessionResult {
 	usage: RunSessionUsage;
 	/** Set when the session ended in a provider/session error (e.g. a 402). transcriptSummary may be empty in that case. */
 	error?: string;
+	/**
+	 * M2s3: the caller's own classification of `error` (via
+	 * `classifyProviderError`), when it has access to the raw SDK
+	 * `stopReason`/`errorMessage` that produced it (see
+	 * packages/vibe/src/loop-session.ts). When omitted, the controller falls
+	 * back to `classifyProviderError(undefined, error)` itself so hand-built
+	 * test fixtures (which only set `error`) keep working unchanged.
+	 */
+	errorKind?: ProviderErrorKind;
 }
 
 export interface RunSessionContext {
 	/** The loop's project root — identical to the `workspaceDir` passed to runLoop(). Session tools resolve `<workspaceDir>/workspace`. */
 	workspaceDir: string;
 	iteration: number;
-	/** The model for this iteration's role — `roles.reasoner.model` for a normal iteration, `roles.checker.model` for a CHECKER iteration. */
+	/** The model for this iteration's role — `roles.reasoner.model` (or a healthy fallback) for a normal iteration, `roles.checker.model` (or fallback) for a CHECKER iteration. */
 	model: string;
 	/**
 	 * The session role for this iteration: "reasoner" for the normal
@@ -68,18 +84,29 @@ export interface LoopDeps {
 	/** Called after every completed iteration (success or error) so a caller (e.g. the CLI) can print progress. */
 	onIteration?: (progress: IterationProgress) => void;
 	/** Called once when the loop stops, before the dossier is (re)generated. */
-	onStop?: (info: { reason: string }) => void;
+	onStop?: (info: { reason: StopReason; detail?: string }) => void;
+	/**
+	 * M2s3: polled at the top of every loop pass (before starting a new
+	 * iteration) so a caller can request a graceful stop — spec "Resume &
+	 * stop": "first Ctrl+C lets the current session finish, ... stops with
+	 * USER_INTERRUPT." The real wiring (packages/vibe/src/cli.ts) sets this
+	 * from a `createSigintHandler` (packages/vibe-core/src/loop/sigint.ts).
+	 * Omit to disable interrupt handling (e.g. in most existing tests).
+	 */
+	interrupted?: () => boolean;
 }
 
 export interface RunLoopOptions {
 	/** Load existing loop-state.json and continue iteration numbering instead of starting fresh. */
 	resume?: boolean;
-	/** Required alongside resume:true to continue a loop whose state was already marked stopped. */
+	/** Required alongside resume:true to continue a loop whose state was already marked stopped — except AWAITING_FUEL and USER_INTERRUPT, which resume without it (spec "Resume & stop"). */
 	force?: boolean;
 }
 
 export interface RunLoopResult {
-	stopReason: string;
+	stopReason: StopReason;
+	/** Human-readable detail for `stopReason` (e.g. "token budget exceeded (150/100 tokens)"). Absent for INVESTIGATION_COMPLETE, which is self-explanatory. */
+	stopDetail?: string;
 	iterations: number;
 	tokensSpent: number;
 	dossierPath: string;
@@ -87,7 +114,7 @@ export interface RunLoopResult {
 
 export const INVESTIGATION_COMPLETE_MARKER = "INVESTIGATION_COMPLETE";
 
-/** The two-strike rule (CLAUDE.md routing rules; echoed in loop-design.md "Budgets & provider health"): this many consecutive session errors stops the loop. */
+/** The two-strike rule (CLAUDE.md routing rules; echoed in loop-design.md "Budgets & provider health"): this many consecutive session errors stops the loop. Fuel/auth errors do NOT count here — they drive fallback switching / AWAITING_FUEL instead. */
 const MAX_CONSECUTIVE_ERRORS = 2;
 
 /**
@@ -141,10 +168,39 @@ function buildCheckerObjective(proposals: Proposal[]): string {
 }
 
 /**
+ * The first model in `[roleConfig.model, ...roleConfig.fallbacks]` that isn't
+ * marked unhealthy in `providerHealth` — spec "Budgets & provider health".
+ * Returns `undefined` when the primary and every fallback are unhealthy.
+ */
+function selectHealthyModel(
+	roleConfig: RoleConfig,
+	providerHealth: Record<string, ProviderHealthEntry>,
+): string | undefined {
+	const candidates = [roleConfig.model, ...(roleConfig.fallbacks ?? [])];
+	return candidates.find((candidate) => providerHealth[candidate] === undefined);
+}
+
+/** Per-model health summary for the AWAITING_FUEL stop detail/journal note — spec: "stop with reason AWAITING_FUEL, journaling a per-model health summary." */
+function describeRoleHealth(
+	role: string,
+	roleConfig: RoleConfig,
+	providerHealth: Record<string, ProviderHealthEntry>,
+): string {
+	const candidates = [roleConfig.model, ...(roleConfig.fallbacks ?? [])];
+	const lines = candidates.map((model) => {
+		const health = providerHealth[model];
+		return health ? `${model}: ${health.status} (at ${health.at})` : `${model}: healthy`;
+	});
+	return `Role "${role}" has no healthy model left (primary + all fallbacks unhealthy): ${lines.join("; ")}.`;
+}
+
+/**
  * Runs the autonomous research loop against `workspaceDir` until a stop
  * condition holds: an iteration/token/wall-clock budget is exceeded, two
- * consecutive session errors occur, or a session's final message contains
- * the literal `INVESTIGATION_COMPLETE` marker. Every stop is journaled and a
+ * consecutive non-fuel/auth session errors occur, every model for the
+ * active role is unhealthy (AWAITING_FUEL), a session's final message
+ * contains the literal `INVESTIGATION_COMPLETE` marker, or the caller
+ * requests an interrupt (USER_INTERRUPT). Every stop is journaled and a
  * dossier is (re)generated before returning.
  *
  * `problem` is required to start a fresh loop; on `options.resume` it is
@@ -176,13 +232,25 @@ export async function runLoop(
 		}
 		state = loadState(dataDir);
 		if (state.stopped) {
-			if (!options.force) {
+			const stoppedReason = state.stopped.reason as StopReason;
+			const resumableWithoutForce = RESUMABLE_WITHOUT_FORCE.has(stoppedReason);
+			if (!options.force && !resumableWithoutForce) {
 				throw new Error(
 					`loop already stopped (reason: "${state.stopped.reason}", at ${state.stopped.at}); pass --force to resume anyway`,
 				);
 			}
-			journal.note("resume", `Forced resume past previous stop (was: "${state.stopped.reason}").`);
-			state = { ...state, stopped: undefined };
+			// AWAITING_FUEL is a pause, not a completion: clear provider health for a fresh attempt, with or
+			// without --force (spec "Budgets & provider health"). Other stops leave providerHealth untouched.
+			const clearingHealth = stoppedReason === StopReason.AWAITING_FUEL;
+			journal.note(
+				"resume",
+				options.force
+					? `Forced resume past previous stop (was: "${state.stopped.reason}").`
+					: `Resuming after ${stoppedReason} pause (iteration ${state.lastCompletedIteration})${
+							clearingHealth ? "; provider health cleared for a fresh attempt" : ""
+						}.`,
+			);
+			state = { ...state, stopped: undefined, ...(clearingHealth ? { providerHealth: {} } : {}) };
 		} else {
 			journal.note("resume", `Resuming after iteration ${state.lastCompletedIteration}.`);
 		}
@@ -201,19 +269,28 @@ export async function runLoop(
 	const deadlineMs = startedAtMs + budget.maxWallClockHours * 60 * 60 * 1000;
 
 	let consecutiveErrors = 0;
-	let stopReason: string | undefined;
+	let stopReason: StopReason | undefined;
+	let stopDetail: string | undefined;
 
 	while (!stopReason) {
+		if (deps.interrupted?.()) {
+			stopReason = StopReason.USER_INTERRUPT;
+			stopDetail = "Interrupted by user (Ctrl+C) before starting a new iteration.";
+			break;
+		}
 		if (state.iteration >= budget.maxIterations) {
-			stopReason = `iteration cap reached (${budget.maxIterations})`;
+			stopReason = StopReason.BUDGET_ITERATIONS;
+			stopDetail = `iteration cap reached (${budget.maxIterations})`;
 			break;
 		}
 		if (state.budgetSpent.tokens >= budget.maxTokens) {
-			stopReason = `token budget exceeded (${state.budgetSpent.tokens}/${budget.maxTokens} tokens)`;
+			stopReason = StopReason.BUDGET_TOKENS;
+			stopDetail = `token budget exceeded (${state.budgetSpent.tokens}/${budget.maxTokens} tokens)`;
 			break;
 		}
 		if (now() >= deadlineMs) {
-			stopReason = `wall-clock budget exceeded (${budget.maxWallClockHours}h)`;
+			stopReason = StopReason.BUDGET_WALLCLOCK;
+			stopDetail = `wall-clock budget exceeded (${budget.maxWallClockHours}h)`;
 			break;
 		}
 
@@ -224,10 +301,21 @@ export async function runLoop(
 		const iteration = state.iteration + 1;
 		const ledger = openLedger(dataDir);
 		const openProposals = ledger.listProposals("open");
-		const checkerRole = config.roles.checker;
-		const isCheckerIteration = openProposals.length > 0 && checkerRole !== undefined;
+		const checkerRoleConfig = config.roles.checker;
+		const isCheckerIteration = openProposals.length > 0 && checkerRoleConfig !== undefined;
 		const role = isCheckerIteration ? "checker" : "reasoner";
-		const model = isCheckerIteration ? (checkerRole as { model: string }).model : config.roles.reasoner.model;
+		const roleConfig = isCheckerIteration ? (checkerRoleConfig as RoleConfig) : config.roles.reasoner;
+
+		// M2s3: pick the first healthy model for this role (primary, else a fallback). If every
+		// candidate is unhealthy, this role can't run — pause the loop rather than burn a session.
+		const model = selectHealthyModel(roleConfig, state.providerHealth);
+		if (model === undefined) {
+			stopReason = StopReason.AWAITING_FUEL;
+			stopDetail = describeRoleHealth(role, roleConfig, state.providerHealth);
+			journal.note("provider-health", stopDetail);
+			break;
+		}
+
 		const objective = isCheckerIteration ? buildCheckerObjective(openProposals) : buildObjective(effectiveProblem);
 		const proposalsResolvedBefore = new Set(ledger.listProposals("resolved").map((p) => p.id));
 		journal.note(
@@ -242,6 +330,25 @@ export async function runLoop(
 		const sessionStartMs = now();
 		const result = await deps.runSession(objective, context);
 		const durationMs = now() - sessionStartMs;
+
+		// M2s3: classify a session error and mark provider health BEFORE checkpointing, so the
+		// checkpoint written below already reflects the (possibly) updated providerHealth map.
+		let errorKind: ProviderErrorKind | undefined;
+		if (result.error) {
+			errorKind = result.errorKind ?? classifyProviderError(undefined, result.error);
+			if (errorKind === ProviderErrorKind.FUEL || errorKind === ProviderErrorKind.AUTH) {
+				const status =
+					errorKind === ProviderErrorKind.FUEL ? ProviderHealthStatus.EXHAUSTED : ProviderHealthStatus.AUTH_FAILED;
+				state.providerHealth = { ...state.providerHealth, [model]: { status, at: new Date(now()).toISOString() } };
+				const nextModel = selectHealthyModel(roleConfig, state.providerHealth);
+				journal.note(
+					"provider-health",
+					nextModel
+						? `${model} marked ${status} (${errorKind} error). Role "${role}" switching to "${nextModel}" for subsequent iterations.`
+						: `${model} marked ${status} (${errorKind} error). Role "${role}" has no remaining healthy model.`,
+				);
+			}
+		}
 
 		// journal (phase "iteration")
 		state.iteration = iteration;
@@ -291,9 +398,17 @@ export async function runLoop(
 		});
 
 		if (result.error) {
+			if (errorKind === ProviderErrorKind.FUEL || errorKind === ProviderErrorKind.AUTH) {
+				// Not a two-strike error: fallback switching / AWAITING_FUEL (handled above and on the
+				// next loop pass) is the response, not the consecutive-error counter.
+				continue;
+			}
+			// rate_limit and other errors: existing two-strike behavior, unchanged. Per spec, a
+			// rate_limit error does NOT mark the model unhealthy — it only counts here when consecutive.
 			consecutiveErrors += 1;
 			if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-				stopReason = `${MAX_CONSECUTIVE_ERRORS} consecutive session errors (last: ${result.error})`;
+				stopReason = StopReason.TWO_STRIKE_ERRORS;
+				stopDetail = `${MAX_CONSECUTIVE_ERRORS} consecutive session errors (last: ${result.error})`;
 				break;
 			}
 			continue;
@@ -301,12 +416,16 @@ export async function runLoop(
 		consecutiveErrors = 0;
 
 		if (result.transcriptSummary.includes(INVESTIGATION_COMPLETE_MARKER)) {
-			stopReason = INVESTIGATION_COMPLETE_MARKER;
+			stopReason = StopReason.INVESTIGATION_COMPLETE;
 			break;
 		}
 	}
 
-	state.stopped = { reason: stopReason as string, at: new Date(now()).toISOString() };
+	state.stopped = {
+		reason: stopReason as StopReason,
+		at: new Date(now()).toISOString(),
+		...(stopDetail ? { detail: stopDetail } : {}),
+	};
 	saveState(dataDir, state);
 
 	// Never auto-approve: if proposals are still open at stop, say so — loudly
@@ -321,8 +440,8 @@ export async function runLoop(
 		);
 	}
 
-	journal.note("checkpoint", `Loop stopped: ${stopReason}`);
-	deps.onStop?.({ reason: stopReason as string });
+	journal.note("checkpoint", `Loop stopped: ${stopReason}${stopDetail ? ` — ${stopDetail}` : ""}`);
+	deps.onStop?.({ reason: stopReason as StopReason, detail: stopDetail });
 
 	const dossier = generateDossier(dataDir, {
 		title: `Autonomous loop: ${effectiveProblem}`,
@@ -330,7 +449,8 @@ export async function runLoop(
 	});
 
 	return {
-		stopReason: stopReason as string,
+		stopReason: stopReason as StopReason,
+		...(stopDetail ? { stopDetail } : {}),
 		iterations: state.iteration,
 		tokensSpent: state.budgetSpent.tokens,
 		dossierPath: dossier.path,

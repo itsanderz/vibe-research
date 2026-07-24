@@ -87,6 +87,40 @@ describe("validateConfig — rejected shapes", () => {
 	});
 });
 
+describe("validateConfig — fallbacks (M2s3, spec 'Budgets & provider health')", () => {
+	it("accepts a role with a fallbacks list", () => {
+		const config = validateConfig({
+			roles: {
+				reasoner: {
+					model: "openrouter/anthropic/claude-sonnet-5",
+					fallbacks: ["openrouter/anthropic/claude-haiku"],
+				},
+			},
+		});
+		expect(config.roles.reasoner.fallbacks).toEqual(["openrouter/anthropic/claude-haiku"]);
+	});
+
+	it("omits fallbacks entirely from the parsed role when not given", () => {
+		const config = validateConfig({ roles: { reasoner: { model: "openrouter/anthropic/claude-sonnet-5" } } });
+		expect(config.roles.reasoner.fallbacks).toBeUndefined();
+	});
+
+	it("rejects a non-array fallbacks field", () => {
+		expect(() => validateConfig({ roles: { reasoner: { model: "x/y", fallbacks: "x/z" } } })).toThrow(
+			/fallbacks must be an array/,
+		);
+	});
+
+	it("rejects a fallbacks array containing a non-string or empty entry", () => {
+		expect(() => validateConfig({ roles: { reasoner: { model: "x/y", fallbacks: [42] } } })).toThrow(
+			ConfigValidationError,
+		);
+		expect(() => validateConfig({ roles: { reasoner: { model: "x/y", fallbacks: [""] } } })).toThrow(
+			ConfigValidationError,
+		);
+	});
+});
+
 describe("assertDistinctCheckerFamily", () => {
 	it("is a no-op when no roles.checker is configured", () => {
 		const config = validateConfig({ roles: { reasoner: { model: "openrouter/anthropic/claude-sonnet-5" } } });
@@ -112,6 +146,50 @@ describe("assertDistinctCheckerFamily", () => {
 		});
 		expect(() => assertDistinctCheckerFamily(config)).toThrow(ConfigValidationError);
 		expect(() => assertDistinctCheckerFamily(config)).toThrow(/different model family/);
+	});
+
+	it("refuses when a CHECKER FALLBACK collides in family with the reasoner (M2s3)", () => {
+		const config = validateConfig({
+			roles: {
+				reasoner: { model: "openrouter/anthropic/claude-sonnet-5" },
+				checker: {
+					model: "openrouter/openai/gpt-5.6-sol",
+					fallbacks: ["anthropic/claude-haiku"], // same family ("anthropic") as the reasoner
+				},
+			},
+		});
+		expect(() => assertDistinctCheckerFamily(config)).toThrow(ConfigValidationError);
+		expect(() => assertDistinctCheckerFamily(config)).toThrow(/different model family/);
+	});
+
+	it("refuses when the checker's primary collides in family with a REASONER FALLBACK (M2s3)", () => {
+		const config = validateConfig({
+			roles: {
+				reasoner: {
+					model: "openrouter/anthropic/claude-sonnet-5",
+					fallbacks: ["openrouter/deepseek/deepseek-v4"],
+				},
+				checker: { model: "deepseek/deepseek-flash" }, // same family ("deepseek") as the reasoner's fallback
+			},
+		});
+		expect(() => assertDistinctCheckerFamily(config)).toThrow(ConfigValidationError);
+		expect(() => assertDistinctCheckerFamily(config)).toThrow(/different model family/);
+	});
+
+	it("allows a checker whose primary + fallbacks are all distinct from the reasoner's primary + fallbacks (M2s3)", () => {
+		const config = validateConfig({
+			roles: {
+				reasoner: {
+					model: "openrouter/anthropic/claude-sonnet-5",
+					fallbacks: ["openrouter/anthropic/claude-haiku"],
+				},
+				checker: {
+					model: "openrouter/openai/gpt-5.6-sol",
+					fallbacks: ["openrouter/deepseek/deepseek-v4"],
+				},
+			},
+		});
+		expect(() => assertDistinctCheckerFamily(config)).not.toThrow();
 	});
 });
 

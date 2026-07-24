@@ -4,6 +4,9 @@ import { openJournal } from "../journal/journal.ts";
 import { openLedger } from "../ledger/store.ts";
 import { STATUS_RANK } from "../ledger/transitions.ts";
 import { type Claim, ClaimStatus } from "../ledger/types.ts";
+import { loadState, type StoppedInfo, stateExists } from "../loop/state.ts";
+import { STOP_BANNER_TEXT, type StopReason } from "../loop/stop-reason.ts";
+import { listPreregs, type PreregView, preregPath } from "../prereg/prereg.ts";
 import { checkReportLanguage, PERMITTED_CONCLUSION_LANGUAGE, type PhrasingViolation } from "../report/phrasing.ts";
 
 /**
@@ -239,6 +242,76 @@ function buildExperimentsSection(runs: readonly RunSummary[]): string {
 	].join("\n");
 }
 
+/**
+ * "Pre-registrations" — M2s3, spec "Empirical lane". One block per
+ * registration event ever recorded (the original and every amendment, each
+ * its own `PreregView` — see `prereg/prereg.ts`'s `listPreregs`), with its
+ * metrics table, amendment chain, and every outcome recorded against exactly
+ * that id. This section only appears in the dossier at all when
+ * `prereg.jsonl` exists (see the call site in `generateDossier`) — a run
+ * with no empirical lane simply omits it, same pattern as "no claims" /
+ * "no experiments" degrade to a one-line message rather than an empty table.
+ */
+function buildPreregSection(views: readonly PreregView[]): string {
+	if (views.length === 0) {
+		return "No pre-registrations have been recorded for this investigation.\n";
+	}
+
+	const blocks = views.map((view) => {
+		const metricRows = view.metrics.map(
+			(m) => `| ${escapeTableCell(m.name)} | ${m.direction} | ${escapeTableCell(m.successThreshold)} |`,
+		);
+		const metricsTable = ["| Metric | Direction | Success threshold |", "|---|---|---|", ...metricRows].join("\n");
+
+		const chainLine =
+			view.amendmentChain.length > 1
+				? `Amendment chain: ${view.amendmentChain.map((id) => `\`${id}\``).join(" -> ")}`
+				: `Amendment chain: \`${view.id}\` (original, not amended)`;
+
+		const outcomesBlock =
+			view.outcomes.length === 0
+				? "Outcomes: none recorded yet."
+				: [
+						"Outcomes:",
+						"",
+						"| Run | Verdict | Metric values | Note |",
+						"|---|---|---|---|",
+						...view.outcomes.map((o) => {
+							const values = Object.entries(o.metricValues)
+								.map(([k, v]) => `${k}=${v}`)
+								.join(", ");
+							return `| \`${o.runId}\` | ${o.verdict} | ${escapeTableCell(values)} | ${escapeTableCell(o.note ?? "")} |`;
+						}),
+					].join("\n");
+
+		return [
+			`### \`${view.id}\`${view.amends ? ` (amends \`${view.amends}\`)` : ""}`,
+			"",
+			`Hypothesis: ${view.hypothesis}`,
+			view.budgetNote ? `Budget: ${view.budgetNote}` : undefined,
+			"",
+			metricsTable,
+			"",
+			chainLine,
+			"",
+			outcomesBlock,
+		]
+			.filter((line) => line !== undefined)
+			.join("\n");
+	});
+
+	return `${blocks.join("\n\n")}\n`;
+}
+
+/** Banner text for the dossier header when the run stopped — M2s3, spec "Resume & stop". `undefined` when there's no checkpoint yet or the checkpoint isn't stopped (a run still in progress or never run through runLoop, e.g. most of this file's own tests). */
+function resolveStopBanner(workspaceDir: string): string | undefined {
+	if (!stateExists(workspaceDir)) return undefined;
+	const state = loadState(workspaceDir);
+	const stopped: StoppedInfo | undefined = state.stopped;
+	if (!stopped) return undefined;
+	return STOP_BANNER_TEXT[stopped.reason as StopReason] ?? `Run stopped: ${stopped.reason}.`;
+}
+
 /** "Limitations & open items" — spec §5 Phase 6 item 6 and §14 acceptance
  * criterion 10 ("the final answer contains ... limitations and next step").
  * Auto-generated, mechanical, per-claim/-run — never free-composed prose
@@ -329,12 +402,15 @@ export function generateDossier(workspaceDir: string, opts: GenerateDossierOptio
 	const headline = mainClaim ? PERMITTED_CONCLUSION_LANGUAGE[mainClaim.status] : NO_CLAIMS_HEADLINE;
 
 	const generatedAt = new Date().toISOString();
+	const stopBanner = resolveStopBanner(workspaceDir);
+	const hasPreregs = existsSync(preregPath(workspaceDir));
 
 	const body = [
 		`# ${title}`,
 		"",
 		`Generated: ${generatedAt}`,
 		"",
+		...(stopBanner ? [`> ${stopBanner}`, ""] : []),
 		`**${headline}**`,
 		"",
 		"## What we found",
@@ -347,6 +423,7 @@ export function generateDossier(workspaceDir: string, opts: GenerateDossierOptio
 		"",
 		buildExperimentsSection(runs),
 		"",
+		...(hasPreregs ? ["## Pre-registrations", "", buildPreregSection(listPreregs(workspaceDir))] : []),
 		"## Limitations & open items",
 		"",
 		buildLimitationsSection(claims, runs),

@@ -14,7 +14,9 @@ import {
 	type RunSessionResult,
 	runLoop,
 } from "../src/loop/controller.ts";
-import { initState, saveState } from "../src/loop/state.ts";
+import { ProviderErrorKind, ProviderHealthStatus } from "../src/loop/provider-error.ts";
+import { initState, loadState, saveState } from "../src/loop/state.ts";
+import { StopReason } from "../src/loop/stop-reason.ts";
 import { aggregateModelbook } from "../src/modelbook/modelbook.ts";
 
 /**
@@ -68,12 +70,26 @@ function makeWorkspaceWithRoles(options: RolesWorkspaceOptions = {}): string {
 	return workspaceDir;
 }
 
+/** Writes an arbitrary vibe.config.json — for fallback/provider-health tests that need role objects richer than makeWorkspace/makeWorkspaceWithRoles expose. */
+function makeWorkspaceWithConfig(config: Record<string, unknown>): string {
+	const workspaceDir = mkdtempSync(join(tmpdir(), "vibe-core-loop-controller-config-"));
+	const dataDir = dataDirFor(workspaceDir);
+	mkdirSync(dataDir, { recursive: true });
+	writeFileSync(join(dataDir, "vibe.config.json"), JSON.stringify(config), "utf8");
+	return workspaceDir;
+}
+
 function okResult(transcriptSummary: string, total = 100): RunSessionResult {
 	return { transcriptSummary, usage: { input: total / 2, output: total / 2, total } };
 }
 
-function errorResult(error: string): RunSessionResult {
-	return { transcriptSummary: "", usage: { input: 0, output: 0, total: 0 }, error };
+function errorResult(error: string, errorKind?: ProviderErrorKind): RunSessionResult {
+	return {
+		transcriptSummary: "",
+		usage: { input: 0, output: 0, total: 0 },
+		error,
+		...(errorKind ? { errorKind } : {}),
+	};
 }
 
 describe("runLoop — budget stop (token cap)", () => {
@@ -86,7 +102,8 @@ describe("runLoop — budget stop (token cap)", () => {
 		expect(runSession).toHaveBeenCalledTimes(1);
 		expect(result.iterations).toBe(1);
 		expect(result.tokensSpent).toBe(150);
-		expect(result.stopReason).toMatch(/token budget exceeded/);
+		expect(result.stopReason).toBe(StopReason.BUDGET_TOKENS);
+		expect(result.stopDetail).toMatch(/token budget exceeded/);
 	});
 });
 
@@ -99,7 +116,8 @@ describe("runLoop — iteration cap", () => {
 
 		expect(runSession).toHaveBeenCalledTimes(1);
 		expect(result.iterations).toBe(1);
-		expect(result.stopReason).toMatch(/iteration cap reached \(1\)/);
+		expect(result.stopReason).toBe(StopReason.BUDGET_ITERATIONS);
+		expect(result.stopDetail).toMatch(/iteration cap reached \(1\)/);
 	});
 });
 
@@ -112,8 +130,9 @@ describe("runLoop — two-strike error stop", () => {
 
 		expect(runSession).toHaveBeenCalledTimes(2);
 		expect(result.iterations).toBe(2);
-		expect(result.stopReason).toMatch(/2 consecutive session errors/);
-		expect(result.stopReason).toMatch(/502 bad gateway/);
+		expect(result.stopReason).toBe(StopReason.TWO_STRIKE_ERRORS);
+		expect(result.stopDetail).toMatch(/2 consecutive session errors/);
+		expect(result.stopDetail).toMatch(/502 bad gateway/);
 	});
 
 	it("a success in between resets the strike count", async () => {
@@ -130,7 +149,7 @@ describe("runLoop — two-strike error stop", () => {
 
 		expect(runSession).toHaveBeenCalledTimes(4);
 		expect(result.iterations).toBe(4);
-		expect(result.stopReason).toMatch(/2 consecutive session errors/);
+		expect(result.stopReason).toBe(StopReason.TWO_STRIKE_ERRORS);
 	});
 });
 
@@ -145,6 +164,9 @@ describe("runLoop — INVESTIGATION_COMPLETE stop", () => {
 
 		expect(runSession).toHaveBeenCalledTimes(1);
 		expect(result.iterations).toBe(1);
+		expect(result.stopReason).toBe(StopReason.INVESTIGATION_COMPLETE);
+		// StopReason.INVESTIGATION_COMPLETE and the session-transcript marker share the same literal
+		// string by design (see stop-reason.ts) — assert that invariant explicitly here.
 		expect(result.stopReason).toBe(INVESTIGATION_COMPLETE_MARKER);
 	});
 });
@@ -200,7 +222,8 @@ describe("runLoop — resume", () => {
 		// running a new session — this asserts --force is accepted (no throw),
 		// not that it magically raises the configured budget.
 		const result = await runLoop(workspaceDir, undefined, { runSession }, { resume: true, force: true });
-		expect(result.stopReason).toMatch(/iteration cap reached \(1\)/);
+		expect(result.stopReason).toBe(StopReason.BUDGET_ITERATIONS);
+		expect(result.stopDetail).toMatch(/iteration cap reached \(1\)/);
 		expect(runSession).toHaveBeenCalledTimes(1);
 	});
 });
@@ -370,5 +393,162 @@ describe("runLoop — modelbook (M2s2, 'learn' step)", () => {
 		expect(agg[reasonerModel].totalTokens).toBe(50);
 		expect(agg[checkerModel].sessions).toBe(1);
 		expect(agg[checkerModel].approvalRate).toBe(1);
+	});
+});
+
+describe("runLoop — provider health & fallbacks (M2s3, spec 'Budgets & provider health')", () => {
+	it("a fuel error switches the role to its next healthy fallback, journaling the switch; once all are exhausted it stops AWAITING_FUEL", async () => {
+		const workspaceDir = makeWorkspaceWithConfig({
+			roles: { reasoner: { model: "provider-a/model-a", fallbacks: ["provider-b/model-b"] } },
+			budget: { maxIterations: 25 },
+		});
+		const seenModels: string[] = [];
+		const runSession: RunSessionFn = vi.fn(async (_objective, context: RunSessionContext) => {
+			seenModels.push(context.model);
+			return errorResult("This request requires more credits, or fewer max_tokens.", ProviderErrorKind.FUEL);
+		});
+
+		const result = await runLoop(workspaceDir, "a trivial problem", { runSession });
+
+		expect(runSession).toHaveBeenCalledTimes(2);
+		expect(seenModels).toEqual(["provider-a/model-a", "provider-b/model-b"]);
+		expect(result.iterations).toBe(2);
+		expect(result.stopReason).toBe(StopReason.AWAITING_FUEL);
+		expect(result.stopDetail).toMatch(/no healthy model left/);
+		expect(result.stopDetail).toMatch(/provider-a\/model-a: exhausted/);
+		expect(result.stopDetail).toMatch(/provider-b\/model-b: exhausted/);
+
+		const healthEntries = openJournal(dataDirFor(workspaceDir))
+			.entries()
+			.filter((e) => e.phase === "provider-health");
+		expect(healthEntries).toHaveLength(3);
+		expect(healthEntries[0].text).toMatch(/provider-a\/model-a marked exhausted/);
+		expect(healthEntries[0].text).toMatch(/switching to "provider-b\/model-b"/);
+		expect(healthEntries[1].text).toMatch(/provider-b\/model-b marked exhausted/);
+		expect(healthEntries[1].text).toMatch(/no remaining healthy model/);
+		expect(healthEntries[2].text).toMatch(/no healthy model left/);
+
+		const finalState = loadState(dataDirFor(workspaceDir));
+		expect(finalState.providerHealth["provider-a/model-a"]?.status).toBe(ProviderHealthStatus.EXHAUSTED);
+		expect(finalState.providerHealth["provider-b/model-b"]?.status).toBe(ProviderHealthStatus.EXHAUSTED);
+	});
+
+	it("an auth error marks the model auth_failed and, with no fallback configured, stops AWAITING_FUEL after one call", async () => {
+		const workspaceDir = makeWorkspaceWithConfig({
+			roles: { reasoner: { model: "provider-a/model-a" } },
+			budget: { maxIterations: 25 },
+		});
+		const runSession: RunSessionFn = vi.fn(async () =>
+			errorResult("401 Unauthorized: invalid API key", ProviderErrorKind.AUTH),
+		);
+
+		const result = await runLoop(workspaceDir, "a trivial problem", { runSession });
+
+		expect(runSession).toHaveBeenCalledTimes(1);
+		expect(result.stopReason).toBe(StopReason.AWAITING_FUEL);
+
+		const finalState = loadState(dataDirFor(workspaceDir));
+		expect(finalState.providerHealth["provider-a/model-a"]?.status).toBe(ProviderHealthStatus.AUTH_FAILED);
+	});
+
+	it("a rate_limit error does not mark the model unhealthy, and only stops the loop via the ordinary two-strike rule", async () => {
+		const workspaceDir = makeWorkspace({ maxIterations: 25 });
+		const runSession: RunSessionFn = vi.fn(async () =>
+			errorResult("429 Too Many Requests", ProviderErrorKind.RATE_LIMIT),
+		);
+
+		const result = await runLoop(workspaceDir, "a trivial problem", { runSession });
+
+		// rate_limit is a plain two-strike error, same as any "other" error — it still stops after 2.
+		expect(runSession).toHaveBeenCalledTimes(2);
+		expect(result.stopReason).toBe(StopReason.TWO_STRIKE_ERRORS);
+
+		const finalState = loadState(dataDirFor(workspaceDir));
+		expect(finalState.providerHealth).toEqual({});
+		const healthEntries = openJournal(dataDirFor(workspaceDir))
+			.entries()
+			.filter((e) => e.phase === "provider-health");
+		expect(healthEntries).toHaveLength(0);
+	});
+
+	it("resumes past AWAITING_FUEL without --force and clears provider health for a fresh attempt", async () => {
+		const workspaceDir = makeWorkspaceWithConfig({
+			roles: { reasoner: { model: "provider-a/model-a", fallbacks: ["provider-b/model-b"] } },
+			budget: { maxIterations: 25 },
+		});
+		const dataDir = dataDirFor(workspaceDir);
+
+		const seeded = initState("a trivial problem");
+		seeded.iteration = 2;
+		seeded.lastCompletedIteration = 2;
+		seeded.providerHealth = {
+			"provider-a/model-a": { status: ProviderHealthStatus.EXHAUSTED, at: "2026-01-01T00:00:00.000Z" },
+			"provider-b/model-b": { status: ProviderHealthStatus.EXHAUSTED, at: "2026-01-01T00:00:01.000Z" },
+		};
+		seeded.stopped = {
+			reason: StopReason.AWAITING_FUEL,
+			at: "2026-01-01T00:00:02.000Z",
+			detail: "both models exhausted",
+		};
+		saveState(dataDir, seeded);
+
+		const seenModels: string[] = [];
+		const runSession: RunSessionFn = vi.fn(async (_objective, context: RunSessionContext) => {
+			seenModels.push(context.model);
+			return okResult(INVESTIGATION_COMPLETE_MARKER);
+		});
+
+		// No --force: AWAITING_FUEL is a pause, not a completion.
+		const result = await runLoop(workspaceDir, undefined, { runSession }, { resume: true });
+
+		expect(runSession).toHaveBeenCalledTimes(1);
+		// Health was cleared, so the role is back on its primary model, not still avoiding it.
+		expect(seenModels).toEqual(["provider-a/model-a"]);
+		expect(result.stopReason).toBe(StopReason.INVESTIGATION_COMPLETE);
+
+		const finalState = loadState(dataDir);
+		expect(finalState.providerHealth).toEqual({});
+
+		const resumeNote = openJournal(dataDir)
+			.entries()
+			.find((e) => e.phase === "resume");
+		expect(resumeNote?.text).toMatch(/AWAITING_FUEL/);
+		expect(resumeNote?.text).toMatch(/provider health cleared/);
+	});
+});
+
+describe("runLoop — USER_INTERRUPT (M2s3, spec 'Resume & stop')", () => {
+	it("stops immediately with USER_INTERRUPT when already interrupted before the first iteration", async () => {
+		const workspaceDir = makeWorkspace({ maxIterations: 25 });
+		const runSession: RunSessionFn = vi.fn(async () => okResult("should never run"));
+
+		const result = await runLoop(workspaceDir, "a trivial problem", { runSession, interrupted: () => true });
+
+		expect(runSession).not.toHaveBeenCalled();
+		expect(result.iterations).toBe(0);
+		expect(result.stopReason).toBe(StopReason.USER_INTERRUPT);
+	});
+
+	it("lets the in-flight iteration finish before stopping — no second session is started", async () => {
+		const workspaceDir = makeWorkspace({ maxIterations: 25 });
+		let interrupted = false;
+		const runSession: RunSessionFn = vi.fn(async () => {
+			// The signal arrives while this "session" is running; it must still be allowed to finish
+			// and be recorded normally — only the NEXT iteration is refused.
+			interrupted = true;
+			return okResult("finished cleanly");
+		});
+
+		const result = await runLoop(workspaceDir, "a trivial problem", { runSession, interrupted: () => interrupted });
+
+		expect(runSession).toHaveBeenCalledTimes(1);
+		expect(result.iterations).toBe(1);
+		expect(result.stopReason).toBe(StopReason.USER_INTERRUPT);
+
+		const iterationEntries = openJournal(dataDirFor(workspaceDir))
+			.entries()
+			.filter((e) => e.phase === "iteration");
+		expect(iterationEntries).toHaveLength(1);
+		expect(iterationEntries[0].text).toContain("finished cleanly");
 	});
 });

@@ -3,14 +3,14 @@ import { join } from "node:path";
 import { familyOf } from "./family.ts";
 
 /**
- * Loop config — spec docs/research/loop-design.md "Roles & the checker gate":
- * `<dataDir>/vibe.config.json`. M2s1 only reads `roles` and `budget`; the
- * `fallbacks` list mentioned in the design's provider-health section lands in
- * a later slice.
+ * Loop config — spec docs/research/loop-design.md "Roles & the checker gate"
+ * and "Budgets & provider health": `<dataDir>/vibe.config.json`.
  */
 
 export interface RoleConfig {
 	model: string;
+	/** Ordered list of fallback models this role switches to (loop/controller.ts's `selectHealthyModel`) once `model` is marked unhealthy — loop-design.md "Budgets & provider health". Optional; omit for no fallback. */
+	fallbacks?: string[];
 }
 
 /** At least `reasoner` must be present; other roles (adversary/checker/librarian/...) are added as slices need them. */
@@ -66,7 +66,26 @@ function validateRoleConfig(role: string, value: unknown): RoleConfig {
 			`roles.${role}.model must be a non-empty string (e.g. "openrouter/anthropic/claude-sonnet-5")`,
 		);
 	}
-	return { model };
+	const fallbacks = validateFallbacks(role, value.fallbacks);
+	return fallbacks !== undefined ? { model, fallbacks } : { model };
+}
+
+function validateFallbacks(role: string, value: unknown): string[] | undefined {
+	if (value === undefined) return undefined;
+	if (!Array.isArray(value)) {
+		throw new ConfigValidationError(`roles.${role}.fallbacks must be an array of model strings`);
+	}
+	const fallbacks = value.map((entry, index) => {
+		if (typeof entry !== "string" || entry.trim().length === 0) {
+			throw new ConfigValidationError(`roles.${role}.fallbacks[${index}] must be a non-empty string`);
+		}
+		// Task spec: "every fallback must parse via familyOf". familyOf(entry) never throws — for any
+		// non-empty string it resolves to a family (single segment = itself), so this call is the
+		// required parse-check; the non-empty-string check above is what actually guards against junk.
+		familyOf(entry);
+		return entry;
+	});
+	return fallbacks;
 }
 
 function validateBudget(value: unknown): Required<LoopBudget> {
@@ -123,19 +142,34 @@ export function validateConfig(raw: unknown): LoopConfig {
  * once at loop start (see `loop/controller.ts`), before any session runs. A
  * config with no `roles.checker` at all is fine — that's the "no checker
  * configured" case (proposals simply stay open).
+ *
+ * M2s3 extension (loop-design.md "Budgets & provider health"): since a role
+ * can fail over to a `fallbacks` model mid-run, EVERY model the checker might
+ * ever run as (its primary + all its fallbacks) must differ in family from
+ * every model the reasoner might ever run as (its primary + all its
+ * fallbacks) — otherwise a fallback switch could silently put two
+ * same-family models on either side of the checker gate.
  */
 export function assertDistinctCheckerFamily(config: LoopConfig): void {
 	const checker = config.roles.checker;
 	if (!checker) return;
 
-	const reasonerFamily = familyOf(config.roles.reasoner.model);
-	const checkerFamily = familyOf(checker.model);
-	if (reasonerFamily === checkerFamily) {
-		throw new ConfigValidationError(
-			`roles.checker ("${checker.model}") must be a different model family than roles.reasoner ` +
-				`("${config.roles.reasoner.model}") — both resolve to family "${reasonerFamily}". A checker from the ` +
-				`same model family cannot provide independent verification (docs/research/loop-design.md "Roles & the checker gate").`,
-		);
+	const reasonerModels = [config.roles.reasoner.model, ...(config.roles.reasoner.fallbacks ?? [])];
+	const checkerModels = [checker.model, ...(checker.fallbacks ?? [])];
+
+	for (const reasonerModel of reasonerModels) {
+		const reasonerFamily = familyOf(reasonerModel);
+		for (const checkerModel of checkerModels) {
+			const checkerFamily = familyOf(checkerModel);
+			if (reasonerFamily === checkerFamily) {
+				throw new ConfigValidationError(
+					`roles.checker model "${checkerModel}" must be a different model family than roles.reasoner model ` +
+						`"${reasonerModel}" — both resolve to family "${reasonerFamily}". Every checker model (primary + ` +
+						`fallbacks) must differ in family from every reasoner model (primary + fallbacks); a same-family ` +
+						`pairing cannot provide independent verification (docs/research/loop-design.md "Roles & the checker gate").`,
+				);
+			}
+		}
 	}
 }
 

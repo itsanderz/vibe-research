@@ -24,8 +24,12 @@ import {
 	generateDossier,
 	openJournal,
 	openLedger,
+	PreregNotFoundError,
+	PreregValidationError,
 	ProposalAlreadyResolvedError,
 	ProposalNotFoundError,
+	recordPreregOutcome,
+	registerPrereg,
 	runExperiment,
 	TransitionError,
 } from "vibe-core";
@@ -430,6 +434,105 @@ const mathGenerateDossier = defineTool({
 	},
 });
 
+const preregExperiment = defineTool({
+	name: "prereg_experiment",
+	label: "Pre-register Experiment",
+	description:
+		"Declare a hypothesis and its success metrics/thresholds BEFORE running anything toward it — appended " +
+		"append-only to workspace/prereg.jsonl. Outcomes may only be judged against these exact pre-registered " +
+		"metrics (via prereg_outcome); if the metrics or thresholds need to change after seeing results, that is " +
+		"NEVER a silent reinterpretation — call prereg_experiment again with `amends` set to this prereg's id to " +
+		"record a new, distinct amendment. Do this before the first math_run_python call it covers, not after.",
+	promptSnippet: "Pre-register a hypothesis and its success metrics before running any experiment toward it",
+	promptGuidelines: [
+		"Always call prereg_experiment before the first experiment it covers — never register a hypothesis after seeing its results.",
+		"To change metrics or thresholds after registering, call prereg_experiment again with `amends` set to the prior id — never reinterpret the old metrics in place.",
+	],
+	parameters: Type.Object({
+		hypothesis: Type.String({ description: "The exact, self-contained hypothesis being tested." }),
+		metrics: Type.Array(
+			Type.Object({
+				name: Type.String({ description: "Metric name, e.g. 'accuracy'." }),
+				direction: StringEnum(["min", "max"] as const, {
+					description: "Whether success means the metric value is at least (max) or at most (min) the threshold.",
+				}),
+				successThreshold: Type.String({
+					description: "The threshold value that counts as success, e.g. '>= 0.9'.",
+				}),
+			}),
+			{ description: "One or more metrics, declared before any run. Must be non-empty." },
+		),
+		budgetNote: Type.Optional(
+			Type.String({ description: "Optional note on the planned experiment budget (e.g. run count/cost cap)." }),
+		),
+		amends: Type.Optional(
+			Type.String({
+				description:
+					"If this registration amends a prior one, its prereg id. Never used to edit — always a new entry.",
+			}),
+		),
+	}),
+	async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+		const prereg = registerPrereg(workspaceDir(ctx), {
+			hypothesis: params.hypothesis,
+			metrics: params.metrics,
+			budgetNote: params.budgetNote,
+			amends: params.amends,
+		});
+		const amendNote = prereg.amends ? ` (amends ${prereg.amends})` : "";
+		return {
+			content: [{ type: "text", text: `Pre-registered ${prereg.id}${amendNote}: ${prereg.hypothesis}` }],
+			details: { prereg },
+		};
+	},
+});
+
+const preregOutcome = defineTool({
+	name: "prereg_outcome",
+	label: "Record Pre-registered Outcome",
+	description:
+		"Record the outcome of a pre-registered experiment against its exact metric values — judged ONLY against " +
+		"the metrics/thresholds already declared in prereg_experiment, never against metrics chosen after seeing " +
+		"the result. verdict is 'kept' if the pre-registered success thresholds were met, 'discarded' otherwise. " +
+		"If you find yourself wanting to judge by a different metric than what was pre-registered, that is a sign " +
+		"you need a new amended prereg (prereg_experiment with `amends`), not a reinterpreted outcome.",
+	promptSnippet: "Record an experiment outcome judged strictly against its pre-registered metrics",
+	promptGuidelines: [
+		"Only record verdict 'kept' when the pre-registered thresholds were actually met — never round up an outcome that missed its declared threshold.",
+	],
+	parameters: Type.Object({
+		preregId: Type.String({ description: "The prereg id this outcome is for, from prereg_experiment." }),
+		runId: Type.String({
+			description: "The math_run_python runId (or other run identifier) this outcome came from.",
+		}),
+		metricValues: Type.Record(Type.String(), Type.String(), {
+			description: "Observed value per pre-registered metric name, e.g. { accuracy: '0.94' }.",
+		}),
+		verdict: StringEnum(["kept", "discarded"] as const, {
+			description: "'kept' if the pre-registered thresholds were met, 'discarded' otherwise.",
+		}),
+		note: Type.Optional(Type.String({ description: "Optional free-text note on the outcome." })),
+	}),
+	async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+		const outcome = recordPreregOutcome(workspaceDir(ctx), {
+			preregId: params.preregId,
+			runId: params.runId,
+			metricValues: params.metricValues,
+			verdict: params.verdict,
+			note: params.note,
+		});
+		return {
+			content: [
+				{
+					type: "text",
+					text: `Outcome recorded for ${outcome.preregId} (run ${outcome.runId}): ${outcome.verdict}.`,
+				},
+			],
+			details: { outcome },
+		};
+	},
+});
+
 /**
  * Factory-of-factory (M2s2): builds a role-bound `ExtensionFactory`.
  * `math_update_claim` gates protected-status transitions into proposals for
@@ -446,6 +549,8 @@ export function createResearchExtension(options?: ResearchExtensionOptions): Ext
 		pi.registerTool(mathRunPython);
 		pi.registerTool(journalNote);
 		pi.registerTool(mathGenerateDossier);
+		pi.registerTool(preregExperiment);
+		pi.registerTool(preregOutcome);
 		if (role === "checker") {
 			pi.registerTool(createMathReviewProposal(role));
 		}
@@ -461,9 +566,19 @@ export default function researchExtension(pi: ExtensionAPI) {
 
 // Exported for the headless registration check (see scripts/check-research-extension.mjs)
 // and for anything that wants to reuse the tool definitions directly.
-export { mathRecordClaim, mathListClaims, mathRunPython, journalNote, mathGenerateDossier };
+export {
+	mathRecordClaim,
+	mathListClaims,
+	mathRunPython,
+	journalNote,
+	mathGenerateDossier,
+	preregExperiment,
+	preregOutcome,
+};
 export { createMathUpdateClaim, createMathReviewProposal, PROTECTED_STATUSES, SESSION_ROLE_ENV_VAR };
 
 // Re-exported so callers of this module don't need a separate vibe-core
-// import just to catch the errors math_update_claim / math_review_proposal can throw.
+// import just to catch the errors math_update_claim / math_review_proposal /
+// prereg_experiment / prereg_outcome can throw.
 export { ClaimNotFoundError, TransitionError, ProposalNotFoundError, ProposalAlreadyResolvedError };
+export { PreregNotFoundError, PreregValidationError };

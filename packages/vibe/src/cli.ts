@@ -11,7 +11,7 @@
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { main } from "@earendil-works/pi-coding-agent";
-import { type IterationProgress, runLoop } from "vibe-core";
+import { createSigintHandler, type IterationProgress, runLoop } from "vibe-core";
 import { runSession } from "./loop-session.ts";
 
 process.title = "vibe";
@@ -56,24 +56,52 @@ async function runVibeRun(args: string[]): Promise<void> {
 				`(${progress.totalTokensSpent} total)${errSuffix}`,
 		);
 	};
-	const onStop = (info: { reason: string }) => {
-		console.log(`[vibe run] stopping: ${info.reason}`);
+	const onStop = (info: { reason: string; detail?: string }) => {
+		console.log(`[vibe run] stopping: ${info.reason}${info.detail ? ` — ${info.detail}` : ""}`);
 	};
+
+	/**
+	 * SIGINT handling (M2s3, spec "Resume & stop"): first Ctrl+C lets the
+	 * current iteration finish, then the controller's own `deps.interrupted`
+	 * check stops the loop cleanly with USER_INTERRUPT (checkpoint, journal,
+	 * dossier all still run — see controller.ts). Second Ctrl+C is the ONE
+	 * acceptable place in this codebase for a raw `process.exit()`: the M2s1
+	 * learning is that calling it while a pi SDK session may still be closing
+	 * async handles crashes on Windows (UV_HANDLE_CLOSING), but by the second
+	 * signal the user has explicitly asked to not wait for a graceful unwind.
+	 * Exit code 130 = 128 + SIGINT, the conventional shell convention.
+	 */
+	const sigint = createSigintHandler({
+		onFirstInterrupt: () => {
+			console.log(
+				"[vibe run] interrupt received — finishing the current iteration, then stopping (Ctrl+C again to force-exit)...",
+			);
+		},
+		onForceExit: () => {
+			console.log("[vibe run] second interrupt — force exiting now.");
+			process.exit(130);
+		},
+	});
+	const handleSigint = () => sigint.handleSignal();
+	process.on("SIGINT", handleSigint);
 
 	try {
 		const result = await runLoop(
 			workspaceDir,
 			resume ? undefined : problem,
-			{ runSession, onIteration, onStop },
+			{ runSession, onIteration, onStop, interrupted: () => sigint.interrupted() },
 			{ resume, force },
 		);
 		console.log(
-			`[vibe run] done — ${result.iterations} iteration(s), ${result.tokensSpent} tokens, stop reason: ${result.stopReason}`,
+			`[vibe run] done — ${result.iterations} iteration(s), ${result.tokensSpent} tokens, stop reason: ${result.stopReason}` +
+				(result.stopDetail ? ` (${result.stopDetail})` : ""),
 		);
 		console.log(`[vibe run] dossier: ${result.dossierPath}`);
 	} catch (error) {
 		console.error(`[vibe run] ${error instanceof Error ? error.message : String(error)}`);
 		process.exitCode = 1;
+	} finally {
+		process.off("SIGINT", handleSigint);
 	}
 }
 

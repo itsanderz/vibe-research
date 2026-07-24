@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import type { ProviderHealthEntry } from "./provider-error.ts";
 
 /**
  * Loop checkpoint — spec docs/research/loop-design.md step 6 ("checkpoint —
@@ -12,8 +13,17 @@ export interface BudgetSpent {
 }
 
 export interface StoppedInfo {
+	/**
+	 * Left as a loose `string` (not the `StopReason` union) so existing
+	 * hand-built fixtures (e.g. loop-state.test.ts's
+	 * `{ reason: "iteration cap reached (25)", at }`) keep type-checking —
+	 * this field predates the M2s3 StopReason refactor. `controller.ts` now
+	 * writes an actual `StopReason` code here; `detail` carries the prose.
+	 */
 	reason: string;
 	at: string;
+	/** Human-readable detail (M2s3+): the prose that `reason` used to hold directly. Optional for back-compat with pre-M2s3 checkpoints. */
+	detail?: string;
 }
 
 export interface LoopState {
@@ -30,8 +40,8 @@ export interface LoopState {
 	budgetSpent: BudgetSpent;
 	lastCompletedIteration: number;
 	stopped?: StoppedInfo;
-	/** Reserved for the provider-health/fallbacks slice (M2s3, loop-design.md "Budgets & provider health"). Empty in M2s1. */
-	providerHealth: Record<string, unknown>;
+	/** Per-model health, keyed by model id — loop-design.md "Budgets & provider health". Empty until a fuel/auth error marks an entry. */
+	providerHealth: Record<string, ProviderHealthEntry>;
 }
 
 const STATE_FILE_NAME = "loop-state.json";

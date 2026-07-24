@@ -24,7 +24,13 @@ import {
 	resolveCliModel,
 	SessionManager,
 } from "@earendil-works/pi-coding-agent";
-import type { RunSessionContext, RunSessionFn, RunSessionResult, RunSessionUsage } from "vibe-core";
+import {
+	classifyProviderError,
+	type RunSessionContext,
+	type RunSessionFn,
+	type RunSessionResult,
+	type RunSessionUsage,
+} from "vibe-core";
 import { createResearchExtension } from "./extensions/research.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -144,19 +150,23 @@ export const runSession: RunSessionFn = async (
 		const last = assistantMessages[assistantMessages.length - 1];
 
 		if (last && last.stopReason === "error") {
+			const error = last.errorMessage ?? 'session ended with stopReason "error"';
 			return {
 				transcriptSummary: extractText(last),
 				usage,
-				error: last.errorMessage ?? 'session ended with stopReason "error"',
+				error,
+				errorKind: classifyProviderError(last.stopReason, last.errorMessage),
 			};
 		}
 
 		return { transcriptSummary: extractText(last), usage };
 	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
 		return {
 			transcriptSummary: "",
 			usage: ZERO_USAGE,
-			error: error instanceof Error ? error.message : String(error),
+			error: message,
+			errorKind: classifyProviderError(undefined, message),
 		};
 	} finally {
 		session.dispose();

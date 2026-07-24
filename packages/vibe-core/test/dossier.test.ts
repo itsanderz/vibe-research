@@ -6,6 +6,9 @@ import { generateDossier } from "../src/dossier/dossier.ts";
 import { openJournal } from "../src/journal/journal.ts";
 import { openLedger } from "../src/ledger/store.ts";
 import { ClaimStatus } from "../src/ledger/types.ts";
+import { initState, saveState } from "../src/loop/state.ts";
+import { StopReason } from "../src/loop/stop-reason.ts";
+import { recordPreregOutcome, registerPrereg } from "../src/prereg/prereg.ts";
 import { PERMITTED_CONCLUSION_LANGUAGE } from "../src/report/phrasing.ts";
 
 function makeTempDir(): string {
@@ -211,5 +214,124 @@ describe("generateDossier", () => {
 		expect(text).toContain("No claims have been recorded for this investigation");
 		expect(text).toContain("No journal entries were recorded");
 		expect(text).toContain("No experiments have been run");
+	});
+});
+
+describe("generateDossier — stop banner (M2s3, spec 'Resume & stop')", () => {
+	it("has no banner when the workspace has no checkpoint at all", () => {
+		const { workspaceDir } = buildWorkspace();
+		const { path } = generateDossier(workspaceDir);
+		const text = readFileSync(path, "utf8");
+		expect(text).not.toContain("Run stopped:");
+	});
+
+	it("has no banner when the checkpoint exists but the loop has not stopped", () => {
+		const { workspaceDir } = buildWorkspace();
+		saveState(workspaceDir, initState("some problem"));
+		const { path } = generateDossier(workspaceDir);
+		const text = readFileSync(path, "utf8");
+		expect(text).not.toContain("Run stopped:");
+	});
+
+	it("renders the AWAITING_FUEL banner as resumable without --force, right after the Generated line", () => {
+		const { workspaceDir } = buildWorkspace();
+		const state = initState("some problem");
+		state.stopped = { reason: StopReason.AWAITING_FUEL, at: new Date().toISOString() };
+		saveState(workspaceDir, state);
+
+		const { path } = generateDossier(workspaceDir);
+		const text = readFileSync(path, "utf8");
+
+		expect(text).toContain("Run stopped: AWAITING_FUEL");
+		expect(text).toContain("Resumable with `vibe run --resume`.");
+		const generatedIdx = text.indexOf("Generated:");
+		const bannerIdx = text.indexOf("Run stopped:");
+		const headlineIdx = text.indexOf("**");
+		expect(generatedIdx).toBeGreaterThanOrEqual(0);
+		expect(bannerIdx).toBeGreaterThan(generatedIdx);
+		expect(bannerIdx).toBeLessThan(headlineIdx);
+	});
+
+	it("renders the USER_INTERRUPT banner as resumable without --force", () => {
+		const { workspaceDir } = buildWorkspace();
+		const state = initState("some problem");
+		state.stopped = { reason: StopReason.USER_INTERRUPT, at: new Date().toISOString() };
+		saveState(workspaceDir, state);
+
+		const text = readFileSync(generateDossier(workspaceDir).path, "utf8");
+		expect(text).toContain("Run stopped: USER_INTERRUPT");
+		expect(text).toContain("Resumable with `vibe run --resume`.");
+	});
+
+	it("renders a non-resumable banner (e.g. BUDGET_TOKENS) stating it needs --force", () => {
+		const { workspaceDir } = buildWorkspace();
+		const state = initState("some problem");
+		state.stopped = { reason: StopReason.BUDGET_TOKENS, at: new Date().toISOString() };
+		saveState(workspaceDir, state);
+
+		const text = readFileSync(generateDossier(workspaceDir).path, "utf8");
+		expect(text).toContain("Run stopped: BUDGET_TOKENS");
+		expect(text).toContain("Not resumable without `vibe run --resume --force`.");
+	});
+});
+
+describe("generateDossier — Pre-registrations section (M2s3, spec 'Empirical lane')", () => {
+	it("omits the section entirely when prereg.jsonl does not exist", () => {
+		const { workspaceDir } = buildWorkspace();
+		const text = readFileSync(generateDossier(workspaceDir).path, "utf8");
+		expect(text).not.toContain("## Pre-registrations");
+	});
+
+	it("renders hypothesis, metrics table, amendment chain, and outcomes when prereg.jsonl exists", () => {
+		const { workspaceDir } = buildWorkspace();
+		const original = registerPrereg(workspaceDir, {
+			hypothesis: "The method improves accuracy over baseline",
+			metrics: [{ name: "accuracy", direction: "max", successThreshold: ">= 0.9" }],
+			budgetNote: "max 20 runs",
+		});
+		const amended = registerPrereg(workspaceDir, {
+			hypothesis: "The method improves accuracy over baseline (revised threshold)",
+			metrics: [{ name: "accuracy", direction: "max", successThreshold: ">= 0.95" }],
+			amends: original.id,
+		});
+		recordPreregOutcome(workspaceDir, {
+			preregId: amended.id,
+			runId: "run-1",
+			metricValues: { accuracy: "0.97" },
+			verdict: "kept",
+			note: "clear win",
+		});
+
+		const text = readFileSync(generateDossier(workspaceDir).path, "utf8");
+		const section = sectionBetween(text, "## Pre-registrations", "## Limitations & open items");
+
+		expect(section).toContain(original.id);
+		expect(section).toContain(amended.id);
+		expect(section).toContain("The method improves accuracy over baseline");
+		expect(section).toContain("(revised threshold)");
+		expect(section).toContain(`amends \`${original.id}\``);
+		expect(section).toContain("accuracy");
+		expect(section).toContain("max");
+		expect(section).toContain(">= 0.95");
+		expect(section).toContain("max 20 runs");
+		expect(section).toContain(`\`${original.id}\` -> \`${amended.id}\``);
+		expect(section).toContain("run-1");
+		expect(section).toContain("kept");
+		expect(section).toContain("accuracy=0.97");
+		expect(section).toContain("clear win");
+		expect(section).toContain("Outcomes: none recorded yet.");
+	});
+
+	it("stays deterministic across two generations once preregs exist", () => {
+		const { workspaceDir } = buildWorkspace();
+		registerPrereg(workspaceDir, {
+			hypothesis: "x",
+			metrics: [{ name: "a", direction: "min", successThreshold: "<= 1" }],
+		});
+
+		const firstText = readFileSync(generateDossier(workspaceDir).path, "utf8");
+		const secondText = readFileSync(generateDossier(workspaceDir).path, "utf8");
+		const strip = (text: string) => text.replace(/^Generated: .*$/m, "Generated: <REDACTED>");
+		expect(strip(firstText)).toBe(strip(secondText));
 	});
 });

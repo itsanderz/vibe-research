@@ -2,9 +2,10 @@
 /**
  * Headless proof that packages/vibe's research extension
  * (packages/vibe/src/extensions/research.ts, compiled to dist/extensions/research.js)
- * registers exactly the 6 expected tools, and that those tools' execute()
- * functions actually create/append the expected workspace files — without
- * spinning up a real pi session or burning any API tokens.
+ * registers exactly the 8 expected tools (M2s3 added prereg_experiment /
+ * prereg_outcome), and that those tools' execute() functions actually
+ * create/append the expected workspace files — without spinning up a real pi
+ * session or burning any API tokens.
  *
  * Run after `npm run build` in packages/vibe (or the root build):
  *   node scripts/check-research-extension.mjs
@@ -46,13 +47,15 @@ const EXPECTED_TOOL_NAMES = [
 	"math_run_python",
 	"journal_note",
 	"math_generate_dossier",
+	"prereg_experiment",
+	"prereg_outcome",
 ];
 
 const registeredNames = registered.map((t) => t.name);
 assert.deepEqual(
 	[...registeredNames].sort(),
 	[...EXPECTED_TOOL_NAMES].sort(),
-	`expected exactly the 6 research tools, got: ${registeredNames.join(", ")}`,
+	`expected exactly the 8 research tools, got: ${registeredNames.join(", ")}`,
 );
 
 for (const tool of registered) {
@@ -168,6 +171,40 @@ if (wslAvailable) {
 	console.log("SKIP math_run_python (WSL not available in this environment)");
 }
 
+// --- 2b. prereg_experiment / prereg_outcome (M2s3): append-only pre-registration ---
+const preregResult = await byName.prereg_experiment.execute(
+	"call-prereg-1",
+	{
+		hypothesis: "headless check: the method improves accuracy",
+		metrics: [{ name: "accuracy", direction: "max", successThreshold: ">= 0.9" }],
+		budgetNote: "at most 3 runs",
+	},
+	undefined,
+	noop,
+	ctx,
+);
+const preregId = preregResult.details.prereg.id;
+assert.ok(preregId, "prereg_experiment must return details.prereg.id");
+assert.equal(preregResult.details.prereg.amends, undefined);
+console.log(`OK  prereg_experiment -> ${preregId}`);
+
+const preregOutcomeResult = await byName.prereg_outcome.execute(
+	"call-prereg-2",
+	{ preregId, runId: "headless-check-run-1", metricValues: { accuracy: "0.95" }, verdict: "kept", note: "met threshold" },
+	undefined,
+	noop,
+	ctx,
+);
+assert.equal(preregOutcomeResult.details.outcome.preregId, preregId);
+assert.equal(preregOutcomeResult.details.outcome.verdict, "kept");
+console.log("OK  prereg_outcome -> kept");
+
+const preregPath = join(tmpCwd, "workspace", "prereg.jsonl");
+assert.ok(existsSync(preregPath), `expected ${preregPath} to exist`);
+const preregLines = readFileSync(preregPath, "utf8").trim().split("\n");
+assert.ok(preregLines.length >= 2, "prereg.jsonl should have a registration + outcome event");
+console.log(`OK  ${preregPath} (${preregLines.length} events)`);
+
 // --- 3. math_generate_dossier: renders workspace/dossier.md ----------------
 const dossierResult = await byName.math_generate_dossier.execute(
 	"call-7",
@@ -185,6 +222,8 @@ const dossierText = readFileSync(dossierPath, "utf8");
 assert.ok(dossierText.startsWith("# Headless check dossier\n"), "dossier.md should use the given title as its H1");
 assert.ok(dossierText.includes("Confirmed via headless check script."), "dossier.md should include the journal narrative verbatim");
 assert.ok(dossierText.includes("## Claims & evidence"), "dossier.md should have a Claims & evidence section");
+assert.ok(dossierText.includes("## Pre-registrations"), "dossier.md should have a Pre-registrations section once prereg.jsonl exists");
+assert.ok(dossierText.includes(preregId), "dossier.md Pre-registrations section should include the registered prereg id");
 console.log(`OK  math_generate_dossier -> ${dossierPath} (${dossierResult.details.violations.length} violation(s))`);
 
 rmSync(tmpCwd, { recursive: true, force: true });
@@ -206,9 +245,9 @@ mod.createResearchExtension({ role: "reasoner" })({
 assert.deepEqual(
 	[...reasonerRegistered.map((t) => t.name)].sort(),
 	[...EXPECTED_TOOL_NAMES].sort(),
-	"role:'reasoner' should register exactly the 6 base tools (no math_review_proposal)",
+	"role:'reasoner' should register exactly the 8 base tools (no math_review_proposal)",
 );
-console.log("OK  createResearchExtension({role:'reasoner'}) registers exactly the 6 base tools");
+console.log("OK  createResearchExtension({role:'reasoner'}) registers exactly the 8 base tools");
 
 const roleTmpCwd = mkdtempSync(join(tmpdir(), "vibe-research-check-role-"));
 const reasonerCtx = { cwd: roleTmpCwd, model: { id: "openrouter/anthropic/claude-sonnet-5" } };
@@ -262,7 +301,7 @@ mod.createResearchExtension({ role: "checker" })({
 assert.deepEqual(
 	[...checkerRegistered.map((t) => t.name)].sort(),
 	[...EXPECTED_TOOL_NAMES, "math_review_proposal"].sort(),
-	"role:'checker' should register the 6 base tools plus math_review_proposal",
+	"role:'checker' should register the 8 base tools plus math_review_proposal",
 );
 console.log("OK  createResearchExtension({role:'checker'}) exposes math_review_proposal");
 
