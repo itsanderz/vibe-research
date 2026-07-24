@@ -4,3 +4,4 @@ Append-only build/run learnings. Newest last.
 - 2026-07-24 (M0): SDK embedding does NOT auto-set PI_CODING_AGENT=1 for child-process detection; wrappers must set it explicitly (upstream cli.ts does this itself).
 - 2026-07-24 (M1): repo tsconfig sets `erasableSyntaxOnly` — TS `enum` is forbidden; use const-object + union-type pattern (`ClaimStatus` does this). Applies to all future vibe packages.
 - 2026-07-24 (M1): spec amendment — re-recording the SAME status with new evidence (e.g. widening a tested range at TESTED_SMALL_CASES) is a legal transition; equal rank is neither strengthening nor weakening. Encoded in vibe-core transitions.ts; spec §7 should be read with this note.
+- 2026-07-24 (M1): killing wsl.exe from Windows (taskkill /T /F) does NOT reliably kill the Linux-side python process — WSL interop limitation. Mitigation for overnight loops: wrap the command as `wsl.exe -- timeout <n>s python3 ...` so Linux enforces its own deadline. To be applied in runner.
