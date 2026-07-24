@@ -1,3 +1,14 @@
+# vibe-research
+
+vibe-research is an open-source, model-agnostic autonomous research harness
+for open science ("vibe mathing"). It is a fork of
+[earendil-works/pi](https://github.com/earendil-works/pi), full credit to
+that project and its contributors for the underlying agent harness this is
+built on. Status: **M0 — under construction, follow along.** Licensed MIT,
+same as upstream.
+
+---
+
 <p align="center">
   <a href="https://pi.dev">
     <img alt="pi logo" src="https://pi.dev/logo-auto.svg" width="128">

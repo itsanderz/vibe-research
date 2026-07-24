@@ -1,0 +1,30 @@
+{
+	"name": "vibe-research",
+	"version": "0.1.0",
+	"description": "vibe CLI - fork identity wrapper around @earendil-works/pi-coding-agent for the vibe-research project",
+	"type": "module",
+	"bin": {
+		"vibe": "dist/cli.js"
+	},
+	"files": [
+		"dist",
+		"README.md"
+	],
+	"scripts": {
+		"clean": "shx rm -rf dist",
+		"build": "tsgo -p tsconfig.build.json && shx chmod +x dist/cli.js",
+		"prepublishOnly": "npm run clean && npm run build"
+	},
+	"dependencies": {
+		"@earendil-works/pi-coding-agent": "^0.82.0"
+	},
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/itsanderz/vibe-research.git",
+		"directory": "packages/vibe"
+	},
+	"engines": {
+		"node": ">=22.19.0"
+	}
+}
