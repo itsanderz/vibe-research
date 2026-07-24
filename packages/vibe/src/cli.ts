@@ -11,6 +11,8 @@
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { main } from "@earendil-works/pi-coding-agent";
+import { type IterationProgress, runLoop } from "vibe-core";
+import { runSession } from "./loop-session.ts";
 
 process.title = "vibe";
 // Matches upstream cli.ts / rpc-entry.ts: lets child processes (e.g. the bash
@@ -20,6 +22,73 @@ process.env.PI_CODING_AGENT = "true";
 process.emitWarning = (() => {}) as typeof process.emitWarning;
 
 const here = dirname(fileURLToPath(import.meta.url));
+
+/**
+ * vibe M2 slice 1: `vibe run "<problem>"` / `vibe run --resume [--force]`
+ * drive the autonomous loop (packages/vibe-core/src/loop/controller.ts)
+ * instead of the interactive TUI. Intercepted before the pi-coding-agent
+ * `main()` passthrough below — everything else (including a project that
+ * happens to have a file literally named "run") passes through unchanged.
+ * Workspace is always the current working directory, matching every other
+ * `vibe`/`pi` invocation.
+ */
+async function runVibeRun(args: string[]): Promise<void> {
+	const resume = args.includes("--resume");
+	const force = args.includes("--force");
+	const problem = args
+		.filter((arg) => arg !== "--resume" && arg !== "--force")
+		.join(" ")
+		.trim();
+
+	if (!resume && problem.length === 0) {
+		console.error('Usage: vibe run "<problem>"');
+		console.error("       vibe run --resume [--force]");
+		process.exitCode = 1;
+		return;
+	}
+
+	const workspaceDir = process.cwd();
+
+	const onIteration = (progress: IterationProgress) => {
+		const errSuffix = progress.error ? ` — session error: ${progress.error}` : "";
+		console.log(
+			`[vibe run] iteration ${progress.iteration}: +${progress.tokensSpentThisIteration} tokens ` +
+				`(${progress.totalTokensSpent} total)${errSuffix}`,
+		);
+	};
+	const onStop = (info: { reason: string }) => {
+		console.log(`[vibe run] stopping: ${info.reason}`);
+	};
+
+	try {
+		const result = await runLoop(
+			workspaceDir,
+			resume ? undefined : problem,
+			{ runSession, onIteration, onStop },
+			{ resume, force },
+		);
+		console.log(
+			`[vibe run] done — ${result.iterations} iteration(s), ${result.tokensSpent} tokens, stop reason: ${result.stopReason}`,
+		);
+		console.log(`[vibe run] dossier: ${result.dossierPath}`);
+	} catch (error) {
+		console.error(`[vibe run] ${error instanceof Error ? error.message : String(error)}`);
+		process.exitCode = 1;
+	}
+}
+
+const cliArgs = process.argv.slice(2);
+
+if (cliArgs[0] === "run") {
+	// Let Node exit naturally once the event loop drains (process.exitCode, set
+	// above on error, is honored either way) instead of calling process.exit()
+	// here — an explicit exit() raced a libuv async handle close on Windows
+	// during manual testing (native "UV_HANDLE_CLOSING" assertion after all
+	// intended output had already printed).
+	await runVibeRun(cliArgs.slice(1));
+} else {
+	await runRestOfCli();
+}
 
 /**
  * vibe M1 slice 3: bundle the research tool extension, the vibe-mathing
@@ -47,13 +116,15 @@ const here = dirname(fileURLToPath(import.meta.url));
  * The build script (see package.json) copies skills/vibe-mathing and
  * src/prompts into dist/ alongside the compiled extension.
  */
-const bundledArgs = [
-	"-e",
-	join(here, "extensions", "research.js"),
-	"--skill",
-	join(here, "skills", "vibe-mathing"),
-	"--prompt-template",
-	join(here, "prompts", "investigate.md"),
-];
+async function runRestOfCli(): Promise<void> {
+	const bundledArgs = [
+		"-e",
+		join(here, "extensions", "research.js"),
+		"--skill",
+		join(here, "skills", "vibe-mathing"),
+		"--prompt-template",
+		join(here, "prompts", "investigate.md"),
+	];
 
-await main([...bundledArgs, ...process.argv.slice(2)]);
+	await main([...bundledArgs, ...process.argv.slice(2)]);
+}

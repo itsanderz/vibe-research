@@ -3,5 +3,8 @@ export * from "./journal/journal.ts";
 export * from "./ledger/store.ts";
 export * from "./ledger/transitions.ts";
 export * from "./ledger/types.ts";
+export * from "./loop/config.ts";
+export * from "./loop/controller.ts";
+export * from "./loop/state.ts";
 export * from "./report/phrasing.ts";
 export * from "./runs/runner.ts";
