@@ -1,3 +1,4 @@
+export * from "./dossier/dossier.ts";
 export * from "./journal/journal.ts";
 export * from "./ledger/store.ts";
 export * from "./ledger/transitions.ts";

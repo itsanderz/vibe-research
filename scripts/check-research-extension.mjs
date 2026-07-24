@@ -2,7 +2,7 @@
 /**
  * Headless proof that packages/vibe's research extension
  * (packages/vibe/src/extensions/research.ts, compiled to dist/extensions/research.js)
- * registers exactly the 5 expected tools, and that those tools' execute()
+ * registers exactly the 6 expected tools, and that those tools' execute()
  * functions actually create/append the expected workspace files — without
  * spinning up a real pi session or burning any API tokens.
  *
@@ -39,13 +39,20 @@ const mockApi = {
 
 registerExtension(mockApi);
 
-const EXPECTED_TOOL_NAMES = ["math_record_claim", "math_update_claim", "math_list_claims", "math_run_python", "journal_note"];
+const EXPECTED_TOOL_NAMES = [
+	"math_record_claim",
+	"math_update_claim",
+	"math_list_claims",
+	"math_run_python",
+	"journal_note",
+	"math_generate_dossier",
+];
 
 const registeredNames = registered.map((t) => t.name);
 assert.deepEqual(
 	[...registeredNames].sort(),
 	[...EXPECTED_TOOL_NAMES].sort(),
-	`expected exactly the 5 research tools, got: ${registeredNames.join(", ")}`,
+	`expected exactly the 6 research tools, got: ${registeredNames.join(", ")}`,
 );
 
 for (const tool of registered) {
@@ -160,6 +167,25 @@ if (wslAvailable) {
 } else {
 	console.log("SKIP math_run_python (WSL not available in this environment)");
 }
+
+// --- 3. math_generate_dossier: renders workspace/dossier.md ----------------
+const dossierResult = await byName.math_generate_dossier.execute(
+	"call-7",
+	{ title: "Headless check dossier" },
+	undefined,
+	noop,
+	ctx,
+);
+const dossierPath = join(tmpCwd, "workspace", "dossier.md");
+assert.ok(existsSync(dossierPath), `expected ${dossierPath} to exist`);
+assert.equal(dossierResult.details.path, dossierPath);
+assert.ok(Array.isArray(dossierResult.details.violations), "math_generate_dossier details.violations must be an array");
+
+const dossierText = readFileSync(dossierPath, "utf8");
+assert.ok(dossierText.startsWith("# Headless check dossier\n"), "dossier.md should use the given title as its H1");
+assert.ok(dossierText.includes("Confirmed via headless check script."), "dossier.md should include the journal narrative verbatim");
+assert.ok(dossierText.includes("## Claims & evidence"), "dossier.md should have a Claims & evidence section");
+console.log(`OK  math_generate_dossier -> ${dossierPath} (${dossierResult.details.violations.length} violation(s))`);
 
 rmSync(tmpCwd, { recursive: true, force: true });
 console.log("\nAll checks passed.");

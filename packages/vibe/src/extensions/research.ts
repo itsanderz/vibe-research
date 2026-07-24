@@ -13,7 +13,15 @@ import { join } from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { defineTool, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { ClaimNotFoundError, ClaimStatus, openJournal, openLedger, runExperiment, TransitionError } from "vibe-core";
+import {
+	ClaimNotFoundError,
+	ClaimStatus,
+	generateDossier,
+	openJournal,
+	openLedger,
+	runExperiment,
+	TransitionError,
+} from "vibe-core";
 
 /** Literal tuple (not `Object.values`) so the tool schema keeps literal
  * status types — must stay in sync with `ClaimStatus` in
@@ -255,17 +263,54 @@ const journalNote = defineTool({
 	},
 });
 
+const mathGenerateDossier = defineTool({
+	name: "math_generate_dossier",
+	label: "Generate Dossier",
+	description:
+		"Render the current workspace (claim ledger, research journal, and saved experiment runs) into a " +
+		"self-contained, shareable investigation report at workspace/dossier.md. The headline sentence is chosen " +
+		"verbatim from the spec §11 permitted-phrasing table for the main claim's status — it is never " +
+		"free-composed. Journal text that overclaims relative to the ledger is flagged in the returned violations " +
+		"and annotated in place with a '⚠ language exceeds evidence' footnote, rather than rejected. Call this as " +
+		"the final step of an investigation, after the ledger and journal are up to date.",
+	promptSnippet: "Render the workspace into a shareable dossier.md report",
+	promptGuidelines: [
+		"Call math_generate_dossier as the last step of an investigation, once every load-bearing claim and " +
+			"experiment is already recorded — the dossier only arranges what is already on the ledger and journal.",
+	],
+	parameters: Type.Object({
+		title: Type.Optional(
+			Type.String({ description: "Optional dossier title (H1). Defaults to a generic title if omitted." }),
+		),
+	}),
+	async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+		const result = generateDossier(workspaceDir(ctx), { title: params.title });
+		const text =
+			result.violations.length === 0
+				? `Dossier written to ${result.path}. No language-policy violations found.`
+				: `Dossier written to ${result.path}. ${result.violations.length} language-policy violation(s) found ` +
+					"(annotated with a footnote in the journal narrative where they came from user/model-authored text): " +
+					result.violations.map((v) => `"${v.match}"`).join(", ") +
+					".";
+		return {
+			content: [{ type: "text", text }],
+			details: { path: result.path, violations: result.violations },
+		};
+	},
+});
+
 export default function researchExtension(pi: ExtensionAPI) {
 	pi.registerTool(mathRecordClaim);
 	pi.registerTool(mathUpdateClaim);
 	pi.registerTool(mathListClaims);
 	pi.registerTool(mathRunPython);
 	pi.registerTool(journalNote);
+	pi.registerTool(mathGenerateDossier);
 }
 
 // Exported for the headless registration check (see scripts/check-research-extension.mjs)
 // and for anything that wants to reuse the tool definitions directly.
-export { mathRecordClaim, mathUpdateClaim, mathListClaims, mathRunPython, journalNote };
+export { mathRecordClaim, mathUpdateClaim, mathListClaims, mathRunPython, journalNote, mathGenerateDossier };
 
 // Re-exported so callers of this module don't need a separate vibe-core
 // import just to catch the errors math_update_claim can throw.

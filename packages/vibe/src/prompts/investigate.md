@@ -13,6 +13,10 @@ Along the way:
 - Use `math_list_claims` to check current state / find ids.
 - Narrate the investigation as you go with `journal_note` (hypotheses, results, surprises, dead ends,
   next moves) — not only a summary at the end.
+- As the final step, once every load-bearing claim and experiment is on the ledger, call
+  `math_generate_dossier` to render the shareable `workspace/dossier.md` report. Do not hand-write a
+  final report yourself — the dossier generator is the only place conclusion language is chosen, and it
+  picks that language mechanically from the spec §11 table so it can never overclaim past the evidence.
 
 Problem to investigate:
 
