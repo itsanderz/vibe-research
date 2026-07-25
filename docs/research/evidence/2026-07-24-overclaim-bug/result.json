@@ -1,0 +1,11 @@
+{
+  "runId": "20260724T235950974-6c4528",
+  "purpose": "Verify 30 divides n^5 -n for all integers n in range [-100, 100]",
+  "exitCode": 0,
+  "timedOut": false,
+  "durationMs": 2021,
+  "stdoutTruncated": false,
+  "stderrTruncated": false,
+  "createdAt": "2026-07-24T23:59:50.974Z",
+  "pythonCommand": "wsl.exe -d Ubuntu -- timeout 65s python3 /mnt/c/Users/drewm/code/vibe-demos/n5-local/workspace/runs/20260724T235950974-6c4528/experiment.py"
+}
